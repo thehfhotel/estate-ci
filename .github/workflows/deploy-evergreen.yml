@@ -116,6 +116,19 @@ jobs:
     outputs:
       image_tag: ${{ steps.meta.outputs.version }}
     steps:
+      # Same refusal as the deploy job's, but BEFORE anything is pushed: on a
+      # pull_request-triggered caller this job would otherwise build the PR's
+      # unreviewed code and push it as :latest — poisoning the very tag that
+      # force_deploy re-rolls onto production — and only then would the deploy
+      # job's guard fire. startsWith also catches pull_request_target (which
+      # carries real secrets, making it worse, not safer) and the
+      # pull_request_review events, whose github.sha is likewise PR code.
+      - name: Refuse to build from a pull_request
+        if: startsWith(github.event_name, 'pull_request')
+        run: |
+          echo "::error::deploy-evergreen.yml was called from a ${GITHUB_EVENT_NAME}-triggered workflow. Restrict the calling workflow to push / workflow_dispatch."
+          exit 1
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v5.0.0
         with:
           persist-credentials: false
@@ -188,9 +201,9 @@ jobs:
       # still reported a green run, and 6 of 26 "successful" runs had deployed
       # nothing before anyone noticed.
       - name: Refuse to deploy from a pull_request
-        if: github.event_name == 'pull_request'
+        if: startsWith(github.event_name, 'pull_request')
         run: |
-          echo "::error::deploy-evergreen.yml was called from a pull_request-triggered workflow. Restrict the calling workflow to push / workflow_dispatch."
+          echo "::error::deploy-evergreen.yml was called from a ${GITHUB_EVENT_NAME}-triggered workflow. Restrict the calling workflow to push / workflow_dispatch."
           exit 1
 
       - name: Checkout compose file
@@ -265,6 +278,7 @@ jobs:
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          BUILD_RESULT: ${{ needs.build.result }}
           APP_NAME: ${{ inputs.app_name }}
           COMPOSE_PATH: ${{ inputs.compose_path }}
           HOST_PORT: ${{ inputs.host_port }}
@@ -286,8 +300,16 @@ jobs:
           done
 
           # force_deploy skipped the build, so there is no SHA tag to deploy —
-          # re-roll whatever :latest currently points at.
+          # re-roll whatever :latest currently points at. ONLY a skipped build
+          # earns the fallback: an empty tag out of a SUCCESSFUL build means
+          # the output wiring broke (a metadata-action output rename, say),
+          # and silently deploying a stale :latest inside a green run is the
+          # exact failure mode this estate keeps scar comments about.
           if [ -z "${IMAGE_TAG:-}" ]; then
+            if [ "${BUILD_RESULT:-}" != "skipped" ]; then
+              echo "::error::build result is '${BUILD_RESULT:-}' yet image_tag is empty — the build output wiring is broken. Refusing to fall back to :latest."
+              exit 1
+            fi
             IMAGE_TAG=latest
             echo "::notice::No build in this run — re-rolling ${APP_NAME} at :latest."
           fi

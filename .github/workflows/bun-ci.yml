@@ -114,3 +114,7 @@ jobs:
       - name: Build
         if: inputs.run_build && steps.scripts.outputs.build == 'true'
         run: bun run build
+
+      - name: No build
+        if: inputs.run_build && steps.scripts.outputs.build != 'true'
+        run: echo "::notice::No \`build\` script in package.json — skipping."
