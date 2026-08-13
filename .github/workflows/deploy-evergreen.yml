@@ -145,8 +145,16 @@ jobs:
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
         with:
           images: ${{ inputs.image }}
+          # The sha tag gets an explicit priority ABOVE raw's default (200):
+          # `steps.meta.outputs.version` — which becomes this workflow's
+          # image_tag output and the host .env's IMAGE_TAG — is the
+          # highest-priority tag. With the defaults (sha=100 < raw=200) every
+          # deploy silently "pinned" :latest, which only worked because the
+          # same run had just refreshed :latest — and quietly broke rollback
+          # semantics and the deployed-tag audit trail (found 2026-08-13 by
+          # the fingerprint conversion's IMAGE_TAG verification).
           tags: |
-            type=sha,prefix=
+            type=sha,prefix=,priority=900
             type=raw,value=latest
 
       - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
