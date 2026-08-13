@@ -1,0 +1,78 @@
+name: "Set up SSH access to an estate deploy host"
+description: >-
+  Install a version-pinned, checksum-verified cloudflared and write the deploy
+  key + known_hosts, ready for `ssh -o ProxyCommand="cloudflared access ssh"`.
+
+  This binary is the ProxyCommand that terminates and relays every SSH session
+  carrying production secrets and the deploy payload. Before it was pinned it
+  was fetched from the MUTABLE `releases/latest` URL with no integrity check,
+  at a dozen separate call sites across the estate — the one unpinned
+  supply-chain input on the most sensitive path, while every GitHub Action in
+  those repos was already SHA-pinned.
+
+  Pinning also removes an availability risk: a `releases/latest` fetch that
+  404s or rate-limits used to fail production deploys for reasons unrelated to
+  the code.
+
+  To bump: change CLOUDFLARED_VERSION below, download the asset, and record its
+  sha256 in CLOUDFLARED_SHA256. Both live here only — one file for the whole
+  estate, not one per repo.
+
+inputs:
+  ssh-key:
+    description: "Private deploy key (pass the caller's EVERGREEN_*_DEPLOY_SSH_KEY secret)."
+    required: true
+  host-key:
+    description: "known_hosts entry for the deploy host (pass EVERGREEN_HOST_KEY)."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install cloudflared (pinned + verified)
+      shell: bash
+      env:
+        CLOUDFLARED_VERSION: "2026.7.3"
+        CLOUDFLARED_SHA256: "9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17"
+      run: |
+        set -euo pipefail
+        url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+        echo "Fetching pinned cloudflared ${CLOUDFLARED_VERSION}"
+        curl -fsSL --retry 3 --retry-connrefused "$url" -o /tmp/cloudflared
+
+        # Verify BEFORE install. A mismatch means the pinned asset changed
+        # underneath us — refuse rather than run an unknown binary as the
+        # transport for production credentials.
+        echo "${CLOUDFLARED_SHA256}  /tmp/cloudflared" | sha256sum -c - || {
+          echo "::error::cloudflared checksum mismatch for ${CLOUDFLARED_VERSION}."
+          echo "Expected ${CLOUDFLARED_SHA256}, got $(sha256sum /tmp/cloudflared | cut -d' ' -f1)."
+          exit 1
+        }
+
+        sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+        cloudflared --version
+
+    - name: Install SSH key + known_hosts
+      shell: bash
+      env:
+        SSH_KEY: ${{ inputs.ssh-key }}
+        HOST_KEY: ${{ inputs.host-key }}
+      run: |
+        set -euo pipefail
+
+        # `required: true` on a composite input only asserts the caller wrote
+        # the key — a deleted, renamed or rotated-to-empty GitHub secret still
+        # renders as "" and passes. Fail here with a name, rather than 40 lines
+        # later inside ssh with "Permission denied (publickey)", which reads as
+        # a host-side authorized_keys problem and has cost an hour more than
+        # once.
+        for v in SSH_KEY HOST_KEY; do
+          if [ -z "${!v:-}" ]; then
+            echo "::error::$v is empty — the deploy secret is unset, renamed, or rotated to an empty value."
+            exit 1
+          fi
+        done
+
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        printf '%s\n' "$SSH_KEY"  > ~/.ssh/deploy_key  && chmod 600 ~/.ssh/deploy_key
+        printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts

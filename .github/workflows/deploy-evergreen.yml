@@ -1,0 +1,361 @@
+name: Deploy to evergreen (reusable)
+
+# The estate's standard deploy, once instead of fourteen times:
+#   - build the image on a GH-hosted ubuntu-latest runner
+#   - push it to GHCR with a registry build cache
+#   - deploy to the target host over the shared cloudflared tunnel, SSHing as
+#     the unprivileged `deploy` user. authorized_keys pins each app's key to
+#     its own /srv/run-deploy-<app>.sh, so a key can ONLY trigger that one
+#     script — never arbitrary commands on prod.
+# No self-hosted runner; CI never shares a host with production.
+#
+# THIS WORKFLOW DOES NOT RUN YOUR TESTS. It cannot: it has no idea what your
+# suite is. The caller MUST gate it, e.g. `needs: [ci]` on a bun-ci.yml call.
+# Both housekeeping and income-ledger carry a scar comment about this exact
+# gap — a deploy job that only `needs` its own build job let a red test suite
+# reach production (four commits, on one of them). If you copy the caller
+# snippet from the README, keep the `needs:`.
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: >-
+          Short app slug — the deploy concurrency group and the job names.
+          Must match the app's run-deploy shim on the host.
+        required: true
+        type: string
+      image:
+        description: "Fully-qualified image name, e.g. ghcr.io/thehfhotel/housekeeping."
+        required: true
+        type: string
+      host_port:
+        description: >-
+          Host port the compose stack binds, written to the container .env as
+          HOST_PORT. String, not number, so a leading zero or a quoted port
+          survives round-tripping.
+        required: true
+        type: string
+      context:
+        description: "Docker build context."
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: "Path to the Dockerfile, relative to the repo root."
+        required: false
+        type: string
+        default: "Dockerfile"
+      compose_path:
+        description: >-
+          Compose file to ship to the host. Renamed to docker-compose.yml
+          inside the tarball if it is called something else, because the
+          run-deploy shim only ever looks for that name (the
+          room-daily-reporter / docker-compose.hfville.yml case).
+        required: false
+        type: string
+        default: "docker-compose.yml"
+      platforms:
+        description: "Buildx target platforms."
+        required: false
+        type: string
+        default: "linux/amd64"
+      force_deploy:
+        description: >-
+          Skip the build and re-roll whatever the image's :latest tag already
+          points at — secret rotation, restarting a wedged container, a
+          compose-only change. An empty commit is NOT an alternative: it
+          produces a green run that deploys nothing.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      ssh_key:
+        description: "Private deploy key for this app (forced-command pinned on the host)."
+        required: true
+      host_key:
+        description: "known_hosts entry for the deploy host."
+        required: true
+      env_payload:
+        description: >-
+          PRE-MATERIALIZED runtime env, one KEY=VALUE per line, appended to the
+          container .env verbatim after IMAGE_TAG and HOST_PORT.
+
+          A reusable workflow cannot enumerate the caller's secrets, so the
+          caller renders them into this one value (see the README snippet).
+          Passed as a secret, not an input, so every component stays masked in
+          the logs.
+
+          One line per variable, no multi-line values — docker compose's .env
+          parser does not support them, so base64 anything with a newline. The
+          deploy step validates the shape and refuses a payload that is not
+          KEY=VALUE lines rather than writing a malformed .env into prod.
+        required: false
+      deploy_host:
+        description: >-
+          SSH target, default evergreen.thehfhotel.org. This repo is PUBLIC:
+          a host reachable only by its tailnet address (hfville, 100.64.x.x)
+          MUST arrive here as a secret and must never be committed as a
+          default. See the README.
+        required: false
+    outputs:
+      image_tag:
+        description: "Tag actually deployed (the commit SHA, or empty on force_deploy)."
+        value: ${{ jobs.build.outputs.image_tag }}
+
+jobs:
+  build:
+    name: Build & push
+    # Skipped, not failed, on force_deploy — the deploy gate below is written
+    # to read that as permission to re-roll :latest.
+    if: ${{ !inputs.force_deploy }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v5.0.0
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ${{ inputs.image }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ inputs.platforms }}
+          # Registry cache, not type=gha: a single image per repo, and the GHA
+          # cache is scoped per-repo anyway, which a shared reusable workflow
+          # would silently thrash across callers.
+          cache-from: type=registry,ref=${{ inputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ inputs.image }}:buildcache,mode=max
+
+  deploy:
+    name: Deploy ${{ inputs.app_name }}
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    # Per-app group: two back-to-back pushes to the same repo can never have
+    # their `docker compose up` interleave. cancel-in-progress is OFF because
+    # an in-flight deploy has already pulled images and may be mid-migration;
+    # aborting it leaves the stack in a mismatched state.
+    #
+    # Concurrency groups are scoped to the CALLING repository, so this does NOT
+    # serialize two different apps against each other. That is deliberate —
+    # separate compose stacks are independent. Where two pipelines share host
+    # state (HF-finance's payroll + reimbursement both bind /home/deploy/
+    # kbiz-queue) the callers must pass the SAME app_name, or serialize
+    # themselves with their own group.
+    concurrency:
+      group: deploy-evergreen-${{ inputs.app_name }}
+      cancel-in-progress: false
+    # `always()` because a SKIPPED `needs` would otherwise skip this job too.
+    #
+    # The success-or-skipped guard is load-bearing and is not a formality: a
+    # FAILED build must block the deploy, while a build skipped by
+    # force_deploy must permit it. Writing this as `needs.build.result !=
+    # 'failure'` or leaning on `always()` alone would let a red build re-roll
+    # :latest onto production and still report a green run. Keep the explicit
+    # success-or-skipped disjunction.
+    if: |
+      always() &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    steps:
+      # The caller owns its triggers, and this workflow deploys to PRODUCTION.
+      # Fail rather than skip: on a sibling repo a deploy that quietly skipped
+      # still reported a green run, and 6 of 26 "successful" runs had deployed
+      # nothing before anyone noticed.
+      - name: Refuse to deploy from a pull_request
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "::error::deploy-evergreen.yml was called from a pull_request-triggered workflow. Restrict the calling workflow to push / workflow_dispatch."
+          exit 1
+
+      - name: Checkout compose file
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v5.0.0
+        with:
+          persist-credentials: false
+          sparse-checkout: ${{ inputs.compose_path }}
+          sparse-checkout-cone-mode: false
+
+      # A reusable workflow runs against the CALLER's checkout, so
+      # `uses: ./.github/actions/evergreen-ssh` would resolve to a path in the
+      # caller's repo and fail — or, worse, silently run the caller's own stale
+      # copy of the action. This repo has to check ITSELF out to use its own
+      # composite action.
+      #
+      # `job.workflow_repository` / `job.workflow_sha` name the file that
+      # defines the CURRENT job — i.e. this reusable workflow, at the exact
+      # commit the caller pinned. So the composite action always comes from the
+      # same commit as the workflow calling it; the two can never drift apart
+      # mid-rollout, and no second SHA needs bumping by hand.
+      # (`github.workflow_sha` is the CALLER's top-level workflow — wrong one.)
+      #
+      # actionlint 1.7.x does not yet know these two properties and will report
+      # `property "workflow_sha" is not defined`. That is a stale context model
+      # in the linter, not a bug here — the properties are documented under the
+      # `job` context and mirror the long-standing `job_workflow_sha` OIDC
+      # claim. Run actionlint with
+      #   -ignore 'property "workflow_(sha|repository)" is not defined'
+      # rather than "fixing" this back to github.workflow_sha, which silently
+      # resolves to the caller's workflow and would check out the wrong repo.
+      - name: Resolve estate-ci's own repo and commit
+        id: self
+        env:
+          SELF_REPO: ${{ job.workflow_repository }}
+          SELF_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # Empty means the runner does not populate job.workflow_* (GitHub
+          # Enterprise Server). Refuse loudly rather than let the checkout below
+          # fall back to the caller's repo at its default branch, which would
+          # run an unpinned action from the wrong repository.
+          for v in SELF_REPO SELF_SHA; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::$v is empty — cannot locate estate-ci's own commit (job.workflow_* is github.com-only). Workaround: replace the checkout below with literal repository/ref values."
+              exit 1
+            fi
+          done
+          echo "repo=$SELF_REPO" >> "$GITHUB_OUTPUT"
+          echo "sha=$SELF_SHA"   >> "$GITHUB_OUTPUT"
+
+      - name: Checkout estate-ci at this workflow's own commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v5.0.0
+        with:
+          repository: ${{ steps.self.outputs.repo }}
+          ref: ${{ steps.self.outputs.sha }}
+          path: .estate-ci
+          persist-credentials: false
+
+      - name: Set up SSH access
+        uses: ./.estate-ci/.github/actions/evergreen-ssh
+        with:
+          ssh-key: ${{ secrets.ssh_key }}
+          host-key: ${{ secrets.host_key }}
+
+      - name: Deploy via SSH
+        env:
+          # GITHUB_TOKEN's packages:read scope is enough for `docker pull` from
+          # the caller's GHCR images, and it expires when the run ends — no
+          # long-lived credential comes to rest on the host. The token that
+          # leaves the CI boundary must carry no repo-write capability, which
+          # is what this job's `permissions:` block above pins.
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          APP_NAME: ${{ inputs.app_name }}
+          COMPOSE_PATH: ${{ inputs.compose_path }}
+          HOST_PORT: ${{ inputs.host_port }}
+          ENV_PAYLOAD: ${{ secrets.env_payload }}
+          DEPLOY_HOST: ${{ secrets.deploy_host || 'evergreen.thehfhotel.org' }}
+        run: |
+          set -euo pipefail
+
+          # A `secrets.SOMETHING` reference that does not exist renders as ""
+          # and the variable is still SET, so `set -u` never trips on it. Fail
+          # before touching the host rather than shipping a well-formed payload
+          # with an empty GHCR token, which the shim turns into a `docker pull`
+          # denial halfway through a deploy.
+          for v in GHCR_TOKEN DEPLOY_HOST HOST_PORT; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::Required value $v is empty — aborting before contacting the host."
+              exit 1
+            fi
+          done
+
+          # force_deploy skipped the build, so there is no SHA tag to deploy —
+          # re-roll whatever :latest currently points at.
+          if [ -z "${IMAGE_TAG:-}" ]; then
+            IMAGE_TAG=latest
+            echo "::notice::No build in this run — re-rolling ${APP_NAME} at :latest."
+          fi
+
+          # The run-deploy shim only ever looks for docker-compose.yml.
+          if [ "$COMPOSE_PATH" != "docker-compose.yml" ]; then
+            mv "$COMPOSE_PATH" docker-compose.yml
+          fi
+
+          # Validate the caller's env block BEFORE it becomes a prod .env.
+          # Never echo a line — it holds secrets; report the line number only.
+          if [ -n "${ENV_PAYLOAD:-}" ]; then
+            lineno=0
+            while IFS= read -r line; do
+              lineno=$((lineno + 1))
+              case "$line" in
+                ''|'#'*) continue ;;
+              esac
+              if ! printf '%s\n' "$line" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*='; then
+                echo "::error::env_payload line $lineno is not KEY=VALUE. One line per variable, no multi-line values (base64 anything with a newline). Value withheld — it is a secret."
+                exit 1
+              fi
+            done <<< "$ENV_PAYLOAD"
+          fi
+
+          # Runtime env shipped alongside compose; docker compose reads ./.env
+          # on `up`. Caller-supplied lines are written unconditionally, empty
+          # values included: an empty value is a valid (usually fail-closed)
+          # state, and writing it explicitly means a rotated-then-cleared
+          # secret cannot leave a stale value behind in the container.
+          {
+            printf 'IMAGE_TAG=%s\n' "$IMAGE_TAG"
+            printf 'HOST_PORT=%s\n' "$HOST_PORT"
+            if [ -n "${ENV_PAYLOAD:-}" ]; then
+              printf '%s\n' "$ENV_PAYLOAD"
+            fi
+          } > .env
+          tar -czf /tmp/deploy.tar.gz docker-compose.yml .env
+          rm -f .env
+
+          # The forced command in the host's authorized_keys runs
+          # /srv/run-deploy-<app>.sh with this JSON as stdin. No other command
+          # is reachable from this key.
+          jq -n \
+            --arg commit_sha         "$GITHUB_SHA" \
+            --arg deploy_payload_b64 "$(base64 -w0 < /tmp/deploy.tar.gz)" \
+            --arg ghcr_user          "$GHCR_USER" \
+            --arg ghcr_token         "$GHCR_TOKEN" \
+            '{
+              commit_sha: $commit_sha,
+              deploy_payload_b64: $deploy_payload_b64,
+              ghcr: { user: $ghcr_user, token: $ghcr_token }
+            }' \
+          | ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              -o ProxyCommand="cloudflared --edge-ip-version 4 access ssh --hostname %h" \
+              "deploy@${DEPLOY_HOST}"
+
+      - name: Deploy summary
+        run: |
+          {
+            echo "## ${APP_NAME} deployed"
+            echo ""
+            echo "- Image: \`${IMAGE}:${IMAGE_TAG:-latest}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          IMAGE: ${{ inputs.image }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}

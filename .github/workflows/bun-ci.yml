@@ -1,0 +1,116 @@
+name: Bun CI (reusable)
+
+# The estate's Bun check suite: install, typecheck, test, build — in that
+# order, so broken code cannot reach a deploy job that `needs` this one.
+#
+# Every step past install is CONDITIONAL on the script existing, because the
+# estate's Bun repos genuinely differ (income-ledger has typecheck + build,
+# host-metrics-pusher has neither). A missing script is a skip with a notice,
+# never a silent pass and never a hard failure — but note the difference:
+# a skipped step still leaves this job green, so the caller is trusting the
+# repo's package.json to declare what it wants checked.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory holding package.json, relative to the repo root."
+        required: false
+        type: string
+        default: "."
+      bun-version:
+        description: "Bun version for oven-sh/setup-bun."
+        required: false
+        type: string
+        default: "1.3"
+      run_build:
+        description: >-
+          Run the `build` script when the package declares one. Turn off for a
+          repo whose build only happens inside the Dockerfile.
+        required: false
+        type: boolean
+        default: true
+      runs-on:
+        description: "Runner label."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+
+jobs:
+  check:
+    name: Bun checks
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v5.0.0
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ inputs.bun-version }}
+
+      # --frozen-lockfile, never a plain install: a lockfile that does not
+      # match package.json must fail CI here, not resolve to something the
+      # committed lockfile never described.
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Detect available scripts
+        id: scripts
+        run: |
+          set -euo pipefail
+
+          has_script() {
+            jq -e --arg s "$1" '.scripts[$s] // empty' package.json >/dev/null 2>&1
+          }
+
+          for s in typecheck test build; do
+            if has_script "$s"; then
+              echo "${s}=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "${s}=false" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
+          # `bun test` with no test files exits 1 ("no test files found"), so a
+          # repo without a `test` script needs the file check before we run it
+          # — otherwise "this repo has no tests yet" would read as a red suite.
+          if [ -n "$(find . -path ./node_modules -prune -o \
+                          \( -name '*.test.ts'  -o -name '*.test.tsx' \
+                          -o -name '*.test.js'  -o -name '*.test.jsx' \
+                          -o -name '*.spec.ts'  -o -name '*.spec.tsx' \) -print -quit)" ]; then
+            echo "test_files=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "test_files=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Typecheck
+        if: steps.scripts.outputs.typecheck == 'true'
+        run: bun run typecheck
+
+      - name: No typecheck script
+        if: steps.scripts.outputs.typecheck != 'true'
+        run: echo "::notice::No \`typecheck\` script in package.json — skipping."
+
+      # Prefer the package's own `test` script when it has one (it may set env,
+      # pick a preload, or scope directories); fall back to bare `bun test`.
+      - name: Test (package script)
+        if: steps.scripts.outputs.test == 'true'
+        run: bun run test
+
+      - name: Test (bun test)
+        if: steps.scripts.outputs.test != 'true' && steps.scripts.outputs.test_files == 'true'
+        run: bun test
+
+      - name: No tests
+        if: steps.scripts.outputs.test != 'true' && steps.scripts.outputs.test_files != 'true'
+        run: echo "::notice::No \`test\` script and no *.test.* / *.spec.* files — skipping tests."
+
+      - name: Build
+        if: inputs.run_build && steps.scripts.outputs.build == 'true'
+        run: bun run build
