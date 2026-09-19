@@ -9,7 +9,7 @@ near-copy of `deploy.yml`.
 | `.github/workflows/deploy-evergreen.yml` | Reusable — buildx build + push to GHCR, then forced-command SSH deploy over the cloudflared tunnel. |
 | `.github/workflows/bun-ci.yml` | Reusable — `bun install --frozen-lockfile` → typecheck → test → build, each conditional on the script existing. |
 | `.github/actions/evergreen-ssh/` | Composite — pinned, checksum-verified cloudflared plus the deploy key and `known_hosts`. |
-| `runner/` | Generic self-hosted runner image (`Dockerfile` + `entrypoint.sh`) built and run on estate-owned infrastructure. Org-specific values (URL, group, labels, work dir) are env vars, never baked in. See `runner/README.md`. |
+| `runner/` | Generic self-hosted runner image (`Dockerfile` + `entrypoint.sh` + `compose.yml`) built and run on estate-owned infrastructure. Org-specific values (URL, group, labels, work dir, host paths) are env vars, never baked in. See `runner/README.md`. |
 
 Why it exists: the estate had accumulated fourteen near-copies of the same
 deploy workflow. Each copy carried its own version of the cloudflared fetch,
@@ -79,7 +79,7 @@ always both true at once:
   to `workflow_dispatch` plus a path filter, never a normal push/PR trigger.
 
 Both reusable workflows here take a `runner_labels` input (a JSON array
-string, e.g. `'["self-hosted","hfville"]'`) precisely so a calling repo can
+string, e.g. `'["self-hosted","<box-label>"]'`) precisely so a calling repo can
 switch between the two without this repo needing to know what the estate's
 actual label set is. Left empty (the default), both workflows behave exactly
 as before — a GitHub-hosted `runs-on`. **The concrete label set, the
@@ -183,7 +183,7 @@ in the diff.
 | `app_name` | yes | — | Concurrency group `deploy-evergreen-<app_name>`; matches `/srv/run-deploy-<app>.sh` on the host. |
 | `image` | no | `""` | LEGACY. Full image ref, e.g. `ghcr.io/thehfhotel/housekeeping`. Also names the `:buildcache` tag. Mutually exclusive with `image_name`. |
 | `image_name` | no | `""` | Bare app segment, e.g. `hf-analytics` — no registry prefix. Mutually exclusive with `image`. The registry is resolved at build time (see "Image registry selection" above) and written to the deploy `.env` as `IMAGE_REGISTRY`. |
-| `runner_labels` | no | `""` | JSON array, e.g. `'["self-hosted","hfville"]'`. Applied to both jobs via `fromJSON` when non-empty; empty keeps both on `ubuntu-latest`. |
+| `runner_labels` | no | `""` | JSON array, e.g. `'["self-hosted","<box-label>"]'`. Applied to both jobs via `fromJSON` when non-empty; empty keeps both on `ubuntu-latest`. |
 | `build_timeout_minutes` | no | `30` | `timeout-minutes` on the build job. |
 | `deploy_timeout_minutes` | no | `15` | `timeout-minutes` on the deploy job. |
 | `host_port` | yes | — | Written to the container `.env` as `HOST_PORT`. A string, so quote it. |
@@ -227,8 +227,8 @@ Two details worth knowing before you edit it:
 | `bun-version` | `1.3` | |
 | `run_build` | `true` | Runs `bun run build` when the script exists. Off for repos that build only inside the Dockerfile. |
 | `runs-on` | `ubuntu-latest` | Ignored when `runner_labels` is set. |
-| `runner_labels` | `""` | JSON array, e.g. `'["self-hosted","hfville"]'`. Non-empty replaces `runs-on` via `fromJSON`. |
-| `timeout_minutes` | `15` | `timeout-minutes` on the job. |
+| `runner_labels` | `""` | JSON array, e.g. `'["self-hosted","<box-label>"]'`. Non-empty replaces `runs-on` via `fromJSON`. |
+| `timeout-minutes` | `15` | `timeout-minutes` on the job. |
 
 Typecheck runs if a `typecheck` script exists. Tests run via the package's own
 `test` script if it has one, else bare `bun test` if any `*.test.*`/`*.spec.*`

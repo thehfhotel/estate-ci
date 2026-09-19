@@ -26,6 +26,11 @@ rebuilds regardless — see the comment in the Dockerfile).
 
 ## Run
 
+`compose.yml` in this directory is a generic template for one instance —
+copy it per runner and fill in the host paths and env values for your own
+box (state dir, work dir, tool cache dir must all be host paths; `RUNNER_NAME`
+and the service/container name must be unique per instance).
+
 The container expects these env vars (all required unless noted):
 
 | Var | Meaning |
@@ -49,10 +54,16 @@ registers, and deletes the file. If the runner is already registered
 (`/runner/.runner` present), the token is never read even if the file exists
 — delete it yourself once registration has happened.
 
-Docker access: mount `/var/run/docker.sock` and give the container whatever
-supplementary group owns that socket on the host, so the runner user can use
-Docker without being root. This image installs the Docker CLI, buildx and
-compose plugins for exactly that — building and shipping images IS the job.
+Docker access: mount `/var/run/docker.sock`. The entrypoint looks up (or
+creates) the group that owns the mounted socket's GID and adds `runner` to it
+before starting the runner process, so the container needs no baked-in GID
+and the runner user can use Docker without being root. (A `group_add` on the
+container itself is not enough on its own — the target user's supplementary
+groups come from `/etc/group` at the point the process is `gosu`'d into, not
+from anything injected only at the container/cgroup level — which is why the
+entrypoint does this explicitly.) This image installs the Docker CLI, buildx
+and compose plugins for exactly that — building and shipping images IS the
+job.
 
 ## What this buys, and what it doesn't
 

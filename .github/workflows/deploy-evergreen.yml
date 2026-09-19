@@ -48,7 +48,7 @@ on:
         default: ""
       runner_labels:
         description: >-
-          JSON array of runner labels, e.g. '["self-hosted","hfville"]'.
+          JSON array of runner labels, e.g. '["self-hosted","<box-label>"]'.
           Applied to both the build and deploy jobs via `fromJSON` when
           non-empty; empty (the default) keeps both jobs on `ubuntu-latest`,
           so every existing caller is unaffected.
@@ -220,6 +220,10 @@ jobs:
 
           if [ -n "$IMAGE" ] && [ -n "$IMAGE_NAME" ]; then
             fail "Both 'image' and 'image_name' inputs are set — pick one. 'image' is the legacy full ref (always GHCR); 'image_name' is the bare app segment that lets this workflow pick the registry."
+          fi
+
+          if [ -z "$IMAGE" ] && [ -z "$IMAGE_NAME" ]; then
+            fail "Neither 'image' nor 'image_name' is set — set exactly one. 'image' is the legacy full ref (always GHCR); 'image_name' is the bare app segment that lets this workflow pick the registry."
           fi
 
           if [ -z "$IMAGE_NAME" ] && [ -n "$IMAGE_REGISTRY_SECRET" ]; then
@@ -435,11 +439,35 @@ jobs:
           # (force_deploy) even on the image_name path — recompute it below
           # rather than lose IMAGE_REGISTRY on a re-roll.
           REGISTRY: ${{ needs.build.outputs.registry }}
+          IMAGE: ${{ inputs.image }}
           IMAGE_NAME: ${{ inputs.image_name }}
           IMAGE_REGISTRY_SECRET: ${{ secrets.image_registry }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
+
+          # The build job's own "Resolve image registry" step already refuses
+          # a bad image/image_name/image_registry combination — but that step
+          # lives in the `build` job, which `force_deploy` SKIPS entirely (see
+          # `if: ${{ !inputs.force_deploy }}` on that job). With force_deploy
+          # set, those checks never run, and this job would otherwise sail
+          # past straight to the ssh call below with, e.g., `image_registry`
+          # set but `image_name` empty. Replicate the same fail-closed checks
+          # here, before anything touches the host, using the raw
+          # inputs/secrets (not the build job's outputs, which are empty on a
+          # skip regardless of whether the config was actually valid).
+          if [ -n "${IMAGE:-}" ] && [ -n "${IMAGE_NAME:-}" ]; then
+            echo "::error::Both 'image' and 'image_name' inputs are set — pick one. 'image' is the legacy full ref (always GHCR); 'image_name' is the bare app segment that lets this workflow pick the registry."
+            exit 1
+          fi
+          if [ -z "${IMAGE:-}" ] && [ -z "${IMAGE_NAME:-}" ]; then
+            echo "::error::Neither 'image' nor 'image_name' is set — set exactly one. 'image' is the legacy full ref (always GHCR); 'image_name' is the bare app segment that lets this workflow pick the registry."
+            exit 1
+          fi
+          if [ -z "${IMAGE_NAME:-}" ] && [ -n "${IMAGE_REGISTRY_SECRET:-}" ]; then
+            echo "::error::secrets.image_registry is set but inputs.image_name is empty. image_registry only applies on the image_name path."
+            exit 1
+          fi
 
           # A `secrets.SOMETHING` reference that does not exist renders as ""
           # and the variable is still SET, so `set -u` never trips on it. Fail

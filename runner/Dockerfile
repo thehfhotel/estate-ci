@@ -42,11 +42,16 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Same trust model as a GitHub-hosted runner: the job user can sudo freely
-# inside its own container. Docker socket access (added by the caller via
+# inside its own container, via the base image's own `%sudo` rule (it does
+# `echo "%sudo ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers`, which TRUNCATES
+# /etc/sudoers and drops the `@includedir /etc/sudoers.d` line — so anything
+# written to /etc/sudoers.d/* here would never be parsed) plus `runner`
+# already being in the `sudo` group in the base image. No sudoers file needed
+# from this Dockerfile. Docker socket access (added by the caller via
 # `group_add` at run time, not here — this image has no hostnames or
-# tenant-specific group IDs baked in) is the real privilege boundary.
-RUN echo "runner ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/runner \
-    && chmod 0440 /etc/sudoers.d/runner
+# tenant-specific group IDs baked in, and entrypoint.sh maps the socket's
+# group into `runner`'s supplementary groups at start time) is the real
+# privilege boundary.
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

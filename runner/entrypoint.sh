@@ -45,6 +45,26 @@ if [ ! -f "${RUNNER_HOME}/.runner" ]; then
     exit 1
   fi
 
+  # `gosu` (via gosu's internal setup-user, which mirrors `su`) sets the
+  # target user's supplementary groups from the container's own /etc/group,
+  # NOT from whatever `group_add` the compose file passed to the container at
+  # `docker run` time — a group injected only at the container/cgroup level is
+  # invisible to it. So a docker-socket GID handed in via `group_add` never
+  # reaches the `runner` process unless `runner` is also a member of a group
+  # with that GID in /etc/group. Ensure that membership right before each
+  # gosu call — generically, no GID baked in, so this stays org-agnostic:
+  # look up (or create) the group that owns the mounted socket and add
+  # `runner` to it.
+  if [ -S /var/run/docker.sock ]; then
+    SOCK_GID="$(stat -c '%g' /var/run/docker.sock)"
+    GRP="$(getent group "${SOCK_GID}" | cut -d: -f1)"
+    if [ -z "${GRP}" ]; then
+      GRP=dockerhost
+      groupadd -g "${SOCK_GID}" "${GRP}"
+    fi
+    usermod -aG "${GRP}" runner
+  fi
+
   gosu runner ./config.sh --unattended \
     --url "${RUNNER_URL}" \
     --token "$(cat "${TOKEN_FILE}")" \
@@ -63,4 +83,19 @@ fi
 
 # run.sh's own loop handles self-update between jobs; nothing here disables
 # that (no --disableupdate was passed above either).
+#
+# Re-run the same docker-socket group fixup here: this branch is also reached
+# on every restart of an ALREADY-configured runner (the `if [ ! -f .runner ]`
+# block above is skipped then), so `runner`'s supplementary groups must be
+# ensured on this path too, not only right before the one-time config.sh call.
+if [ -S /var/run/docker.sock ]; then
+  SOCK_GID="$(stat -c '%g' /var/run/docker.sock)"
+  GRP="$(getent group "${SOCK_GID}" | cut -d: -f1)"
+  if [ -z "${GRP}" ]; then
+    GRP=dockerhost
+    groupadd -g "${SOCK_GID}" "${GRP}"
+  fi
+  usermod -aG "${GRP}" runner
+fi
+
 exec gosu runner ./run.sh

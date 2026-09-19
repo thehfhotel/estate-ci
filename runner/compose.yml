@@ -1,0 +1,44 @@
+# Generic compose file for one self-hosted runner instance, built from the
+# image in this directory (`Dockerfile` + `entrypoint.sh`). No org URL, host
+# name, tailnet address or group ID is baked in here — see runner/README.md
+# for what every env var means and how to size the resources below for your
+# own box. This file is a template: copy it per runner (state dir, work dir,
+# container/service name, RUNNER_NAME must all be unique per instance) and
+# fill in the host paths and env values for your own infrastructure.
+#
+# Docker-out-of-docker note: RUNNER_WORKDIR must be bind-mounted at the
+# IDENTICAL absolute path inside the container as on the host, because
+# container actions and `uses: docker://` steps run as sibling containers
+# via the mounted docker socket and see host paths, not container paths.
+
+services:
+  runner:
+    build: .
+    image: hf-runner:local
+    restart: always
+    environment:
+      RUNNER_URL: ${RUNNER_URL:?set the GitHub org or repo URL to register against}
+      RUNNER_NAME: ${RUNNER_NAME:?set a name unique per org/group}
+      RUNNER_GROUP: ${RUNNER_GROUP:?set the runner group to join}
+      RUNNER_LABELS: ${RUNNER_LABELS:?set the custom labels, comma-separated}
+      RUNNER_WORKDIR: ${RUNNER_WORKDIR:?set the absolute work dir path — identical on host and container}
+      RUNNER_TOOL_CACHE: /opt/hostedtoolcache
+      TZ: ${TZ:-UTC}
+    volumes:
+      # Persistent runner identity + self-update state — see README.md.
+      - ${RUNNER_STATE_DIR:?set the host path for this runner's state dir}:/runner
+      # Work dir: same absolute path on both sides of the mount (DooD).
+      - ${RUNNER_WORKDIR:?}:${RUNNER_WORKDIR:?}
+      # Shared tool cache across all runners on this box.
+      - ${RUNNER_TOOLCACHE_DIR:?set the host path for the shared tool cache}:/opt/hostedtoolcache
+      # Docker socket — the runner user's access to it is granted at container
+      # start time by entrypoint.sh (it maps the socket's own GID into the
+      # runner user's supplementary groups), not by anything declared here.
+      - /var/run/docker.sock:/var/run/docker.sock
+    mem_limit: 4g
+    cpus: "2.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

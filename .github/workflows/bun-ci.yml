@@ -37,7 +37,7 @@ on:
         default: "ubuntu-latest"
       runner_labels:
         description: >-
-          JSON array of runner labels, e.g. '["self-hosted","hfville"]'. When
+          JSON array of runner labels, e.g. '["self-hosted","<box-label>"]'. When
           set (non-empty), this replaces `runs-on` entirely via `fromJSON` —
           the estate's private repos pass this instead of `runs-on` so the
           job lands on the self-hosted fleet. Left empty, `runs-on` still
@@ -45,7 +45,7 @@ on:
         required: false
         type: string
         default: ""
-      timeout_minutes:
+      timeout-minutes:
         description: "Job timeout-minutes."
         required: false
         type: number
@@ -55,7 +55,7 @@ jobs:
   check:
     name: Bun checks
     runs-on: ${{ inputs.runner_labels != '' && fromJSON(inputs.runner_labels) || inputs.runs-on }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
     defaults:
