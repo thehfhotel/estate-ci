@@ -9,6 +9,7 @@ near-copy of `deploy.yml`.
 | `.github/workflows/deploy-evergreen.yml` | Reusable — buildx build + push to GHCR, then forced-command SSH deploy over the cloudflared tunnel. |
 | `.github/workflows/bun-ci.yml` | Reusable — `bun install --frozen-lockfile` → typecheck → test → build, each conditional on the script existing. |
 | `.github/actions/evergreen-ssh/` | Composite — pinned, checksum-verified cloudflared plus the deploy key and `known_hosts`. |
+| `runner/` | Generic self-hosted runner image (`Dockerfile` + `entrypoint.sh`) built and run on estate-owned infrastructure. Org-specific values (URL, group, labels, work dir) are env vars, never baked in. See `runner/README.md`. |
 
 Why it exists: the estate had accumulated fourteen near-copies of the same
 deploy workflow. Each copy carried its own version of the cloudflared fetch,
@@ -27,11 +28,13 @@ that changes this — GitHub resolves a `uses:` across repositories against the
 public caller. The reverse direction works fine: a private repo can call a
 public reusable workflow.
 
-Six estate repos are public — `new-hotel`, `loyalty-app`, `income-ledger`,
-`expense-ledger`, `HF-finance`, `reimbursement` — so a private `estate-ci`
-would serve only the private half of the estate and the public half would keep
-its fourteen copies. A public `estate-ci` serves all of them. Visibility here
-is a consequence of that arithmetic, not a preference.
+Four estate repos are public — `estate-ci`, `ezbookkeeping`, `linen-truck`,
+`reimbursement` — so a private `estate-ci` would serve only the private half
+of the estate and the public half would keep its own copies. A public
+`estate-ci` serves all of them. Visibility here is a consequence of that
+arithmetic, not a preference. (The list above has moved over time as repos
+were split, renamed or flipped private; check the org's repo visibility
+directly rather than trusting an old copy of this paragraph.)
 
 ### What public costs, and the rule that pays for it
 
@@ -56,6 +59,54 @@ push "removes". So:
 
 The private `hf-erp-portal` repo owns Cloudflare-as-code and the estate's
 network context. That is where topology lives.
+
+## Self-hosted runners and the estate's own registry
+
+The estate builds and deploys on infrastructure it owns instead of GitHub's
+hosted runners, to keep GitHub Actions spend at $0 (see
+`docs/adr/0001-builds-run-on-estate-owned-infrastructure.md`). Two rules,
+always both true at once:
+
+- **A public repository never carries a self-hosted runner label.** A
+  self-hosted runner (this one included — see `runner/`) trusts every job
+  that lands on it with a docker socket; a public repo accepts PRs from
+  anyone, so a self-hosted label there is an open door to the estate's own
+  infrastructure. Public repos stay on `ubuntu-latest` (or another
+  GitHub-hosted label) unconditionally.
+- **A private repository never falls back to a GitHub-hosted runner**, except
+  a narrowly-scoped job that genuinely needs an OS the self-hosted fleet
+  doesn't provide (native macOS/Windows builds) — and even that is restricted
+  to `workflow_dispatch` plus a path filter, never a normal push/PR trigger.
+
+Both reusable workflows here take a `runner_labels` input (a JSON array
+string, e.g. `'["self-hosted","hfville"]'`) precisely so a calling repo can
+switch between the two without this repo needing to know what the estate's
+actual label set is. Left empty (the default), both workflows behave exactly
+as before — a GitHub-hosted `runs-on`. **The concrete label set, the
+registry's hostname, and every other host detail live in the estate's private
+ops repo, never here.**
+
+### Image registry selection (`deploy-evergreen.yml`)
+
+The workflow supports two ways to name the image it builds, and resolves the
+registry itself so a caller never hardcodes an internal hostname:
+
+| Caller sets | Result |
+|---|---|
+| `image` (legacy, full ref) | Unchanged: always GHCR, `GITHUB_TOKEN`. No `IMAGE_REGISTRY` written. |
+| `image_name` only | GHCR fallback: registry is `ghcr.io/<owner, lowercased>`. `IMAGE_REGISTRY` is written to the deploy `.env`. |
+| `image_name` + secret `image_registry` | The caller's own registry. Requires `registry_user` / `registry_token` secrets to authenticate the push. `IMAGE_REGISTRY` is written to the deploy `.env`. |
+| secret `image_registry` with no `image_name` | Hard error — refused before anything builds. |
+| both `image` and `image_name` | Hard error — pick one. |
+
+A caller's compose file reads the registry at deploy time —
+`${IMAGE_REGISTRY:?IMAGE_REGISTRY missing}/<app>:${IMAGE_TAG:-latest}` — never
+a literal. Cutting a repo over to a non-GHCR registry, or rolling it back, is
+a secret change on that repo (`gh secret set` / `gh secret delete
+IMAGE_REGISTRY`) followed by re-running the deploy — no PR against this repo
+needed either way, and every PR that only switches a caller from `image` to
+`image_name` stays mergeable before any such cutover, because the GHCR
+fallback keeps its behaviour identical to the legacy path.
 
 ## Callers SHA-pin
 
@@ -130,7 +181,11 @@ in the diff.
 | Input | Req | Default | Notes |
 |---|---|---|---|
 | `app_name` | yes | — | Concurrency group `deploy-evergreen-<app_name>`; matches `/srv/run-deploy-<app>.sh` on the host. |
-| `image` | yes | — | Full image ref, e.g. `ghcr.io/thehfhotel/housekeeping`. Also names the `:buildcache` tag. |
+| `image` | no | `""` | LEGACY. Full image ref, e.g. `ghcr.io/thehfhotel/housekeeping`. Also names the `:buildcache` tag. Mutually exclusive with `image_name`. |
+| `image_name` | no | `""` | Bare app segment, e.g. `hf-analytics` — no registry prefix. Mutually exclusive with `image`. The registry is resolved at build time (see "Image registry selection" above) and written to the deploy `.env` as `IMAGE_REGISTRY`. |
+| `runner_labels` | no | `""` | JSON array, e.g. `'["self-hosted","hfville"]'`. Applied to both jobs via `fromJSON` when non-empty; empty keeps both on `ubuntu-latest`. |
+| `build_timeout_minutes` | no | `30` | `timeout-minutes` on the build job. |
+| `deploy_timeout_minutes` | no | `15` | `timeout-minutes` on the deploy job. |
 | `host_port` | yes | — | Written to the container `.env` as `HOST_PORT`. A string, so quote it. |
 | `context` | no | `.` | Docker build context. |
 | `dockerfile` | no | `Dockerfile` | Path from the repo root. |
@@ -142,8 +197,11 @@ in the diff.
 |---|---|---|
 | `ssh_key` | yes | The app's own key, forced-command pinned in the host's `authorized_keys`. |
 | `host_key` | yes | `known_hosts` entry. `StrictHostKeyChecking=yes` — this is the pin. |
-| `env_payload` | no | `KEY=VALUE` lines appended to the container `.env` after `IMAGE_TAG` and `HOST_PORT`. Validated before it is written; no multi-line values (docker compose's `.env` parser does not support them — base64 anything with a newline). |
+| `env_payload` | no | `KEY=VALUE` lines appended to the container `.env` after `IMAGE_TAG`, `HOST_PORT` and (when applicable) `IMAGE_REGISTRY`. Validated before it is written; no multi-line values (docker compose's `.env` parser does not support them — base64 anything with a newline). |
 | `deploy_host` | no | Defaults to `evergreen.thehfhotel.org`. Anything tailnet-only goes here. |
+| `image_registry` | no | Only meaningful with `image_name`. Registry prefix, e.g. `ghcr.io/thehfhotel` or the estate's own registry host — a value that maps internal topology, so it arrives here as a secret, never a literal. Unset means GHCR. |
+| `registry_user` | no | Docker login username when `image_registry` is set. |
+| `registry_token` | no | Docker login password/token when `image_registry` is set. |
 
 Output: `image_tag` — the SHA tag deployed, empty on `force_deploy`.
 
@@ -168,7 +226,9 @@ Two details worth knowing before you edit it:
 | `working-directory` | `.` | Where `package.json` lives. |
 | `bun-version` | `1.3` | |
 | `run_build` | `true` | Runs `bun run build` when the script exists. Off for repos that build only inside the Dockerfile. |
-| `runs-on` | `ubuntu-latest` | |
+| `runs-on` | `ubuntu-latest` | Ignored when `runner_labels` is set. |
+| `runner_labels` | `""` | JSON array, e.g. `'["self-hosted","hfville"]'`. Non-empty replaces `runs-on` via `fromJSON`. |
+| `timeout_minutes` | `15` | `timeout-minutes` on the job. |
 
 Typecheck runs if a `typecheck` script exists. Tests run via the package's own
 `test` script if it has one, else bare `bun test` if any `*.test.*`/`*.spec.*`
