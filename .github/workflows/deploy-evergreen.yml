@@ -26,9 +26,45 @@ on:
         required: true
         type: string
       image:
-        description: "Fully-qualified image name, e.g. ghcr.io/thehfhotel/housekeeping."
-        required: true
+        description: >-
+          LEGACY. Fully-qualified image name, e.g.
+          ghcr.io/thehfhotel/housekeeping. Mutually exclusive with
+          `image_name` — set exactly one. Always pushes to GHCR with
+          GITHUB_TOKEN; no IMAGE_REGISTRY is written to the deploy .env.
+        required: false
         type: string
+        default: ""
+      image_name:
+        description: >-
+          Bare app segment, e.g. hf-analytics (no registry prefix). Mutually
+          exclusive with `image` — set exactly one. The registry is resolved
+          at build time: GHCR (`ghcr.io/<owner>`) unless the `image_registry`
+          secret is set, in which case that value is used instead. Either
+          way the resolved registry is written to the deploy .env as
+          `IMAGE_REGISTRY`, which the caller's compose file reads via
+          `${IMAGE_REGISTRY:?IMAGE_REGISTRY missing}/<image_name>`.
+        required: false
+        type: string
+        default: ""
+      runner_labels:
+        description: >-
+          JSON array of runner labels, e.g. '["self-hosted","<box-label>"]'.
+          Applied to both the build and deploy jobs via `fromJSON` when
+          non-empty; empty (the default) keeps both jobs on `ubuntu-latest`,
+          so every existing caller is unaffected.
+        required: false
+        type: string
+        default: ""
+      build_timeout_minutes:
+        description: "timeout-minutes for the build job."
+        required: false
+        type: number
+        default: 30
+      deploy_timeout_minutes:
+        description: "timeout-minutes for the deploy job."
+        required: false
+        type: number
+        default: 15
       host_port:
         description: >-
           Host port the compose stack binds, written to the container .env as
@@ -98,6 +134,22 @@ on:
           MUST arrive here as a secret and must never be committed as a
           default. See the README.
         required: false
+      image_registry:
+        description: >-
+          Optional. Registry prefix for the image_name path, e.g.
+          `ghcr.io/thehfhotel` or the estate's own registry host. Unset means
+          GHCR is used automatically. Only meaningful with `image_name` — set
+          with `image` (the legacy input) is a hard error, since the legacy
+          path is always GHCR. This repo is PUBLIC: an internal registry
+          hostname or tailnet address MUST arrive here as a secret, never as
+          a literal in a caller's workflow file.
+        required: false
+      registry_user:
+        description: "Username for docker login when image_registry is set."
+        required: false
+      registry_token:
+        description: "Password/token for docker login when image_registry is set."
+        required: false
     outputs:
       image_tag:
         description: "Tag actually deployed (the commit SHA, or empty on force_deploy)."
@@ -109,11 +161,22 @@ jobs:
     # Skipped, not failed, on force_deploy — the deploy gate below is written
     # to read that as permission to re-roll :latest.
     if: ${{ !inputs.force_deploy }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_labels != '' && fromJSON(inputs.runner_labels) || 'ubuntu-latest' }}
+    timeout-minutes: ${{ inputs.build_timeout_minutes }}
     permissions:
       contents: read
       packages: write
     outputs:
+      # image_ref and registry are deliberately NOT exposed here. On the
+      # image_registry path, steps.selection.outputs.registry (and image_ref,
+      # which contains it) equal the `image_registry` secret's value —
+      # GitHub redacts a job output that equals a secret to an EMPTY string
+      # ("Skip output {output.Key} since it may contain secret."), so this
+      # job's outputs would come back empty on every successful build that
+      # uses the estate's own registry, not just on a force_deploy skip. The
+      # deploy job recomputes the registry itself instead, from the same
+      # inputs/secrets this job used, so it never depends on a value GitHub
+      # may silently drop.
       image_tag: ${{ steps.meta.outputs.version }}
     steps:
       # Same refusal as the deploy job's, but BEFORE anything is pushed: on a
@@ -133,18 +196,105 @@ jobs:
         with:
           persist-credentials: false
 
+      # Fail-closed selection between the legacy `image` input (full ref,
+      # always GHCR) and the new `image_name` input (bare app segment, with
+      # the registry resolved here — GHCR by default, or the caller's own
+      # registry via the `image_registry` secret). Exactly one of `image` /
+      # `image_name` may be set. Runs BEFORE login/build so a config error
+      # (both set, or a registry secret with no image_name) is refused before
+      # anything is built or pushed, not discovered mid-push.
+      - name: Resolve image registry
+        id: selection
+        env:
+          IMAGE: ${{ inputs.image }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          IMAGE_REGISTRY_SECRET: ${{ secrets.image_registry }}
+          REGISTRY_USER_SECRET: ${{ secrets.registry_user }}
+          REGISTRY_TOKEN_SECRET: ${{ secrets.registry_token }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            {
+              echo "registry="
+              echo "image_ref="
+              echo "login_host="
+              echo "login_mode=none"
+            } >> "$GITHUB_OUTPUT"
+            echo "::error::$1"
+            exit 1
+          }
+
+          if [ -n "$IMAGE" ] && [ -n "$IMAGE_NAME" ]; then
+            fail "Both 'image' and 'image_name' inputs are set — pick one. 'image' is the legacy full ref (always GHCR); 'image_name' is the bare app segment that lets this workflow pick the registry."
+          fi
+
+          if [ -z "$IMAGE" ] && [ -z "$IMAGE_NAME" ]; then
+            fail "Neither 'image' nor 'image_name' is set — set exactly one. 'image' is the legacy full ref (always GHCR); 'image_name' is the bare app segment that lets this workflow pick the registry."
+          fi
+
+          if [ -z "$IMAGE_NAME" ] && [ -n "$IMAGE_REGISTRY_SECRET" ]; then
+            fail "secrets.image_registry is set but inputs.image_name is empty. image_registry only applies on the image_name path."
+          fi
+
+          if [ -z "$IMAGE_NAME" ]; then
+            # Legacy path — unchanged behaviour. No IMAGE_REGISTRY line is
+            # written to the deploy .env; the caller's compose file still
+            # hardcodes ghcr.io/... in its own `image:` line.
+            {
+              echo "registry="
+              echo "image_ref=$IMAGE"
+              echo "login_host=ghcr.io"
+              echo "login_mode=ghcr"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$IMAGE_REGISTRY_SECRET" ]; then
+            # image_name set, no registry secret: GHCR fallback. Behaviour is
+            # identical to the legacy path except the caller's compose file
+            # now reads IMAGE_REGISTRY from .env instead of hardcoding
+            # ghcr.io/<owner> — this is what makes a switch to image_name
+            # mergeable before any registry cutover.
+            registry="ghcr.io/$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+            {
+              echo "registry=$registry"
+              echo "image_ref=$registry/$IMAGE_NAME"
+              echo "login_host=ghcr.io"
+              echo "login_mode=ghcr"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # image_name set AND image_registry set: the caller's own registry.
+          # login_host strips any path segment (a registry value may already
+          # include a namespace, e.g. ghcr.io/some-org) since docker/login-
+          # action's `registry:` input wants a bare host.
+          if [ -z "$REGISTRY_USER_SECRET" ] || [ -z "$REGISTRY_TOKEN_SECRET" ]; then
+            fail "secrets.image_registry is set but registry_user/registry_token are missing — cannot authenticate the push."
+          fi
+          registry="$IMAGE_REGISTRY_SECRET"
+          login_host="${registry%%/*}"
+          {
+            echo "registry=$registry"
+            echo "image_ref=$registry/$IMAGE_NAME"
+            echo "login_host=$login_host"
+            echo "login_mode=registry"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ steps.selection.outputs.login_host }}
+          username: ${{ steps.selection.outputs.login_mode == 'ghcr' && github.actor || secrets.registry_user }}
+          password: ${{ steps.selection.outputs.login_mode == 'ghcr' && secrets.GITHUB_TOKEN || secrets.registry_token }}
 
       - id: meta
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
         with:
-          images: ${{ inputs.image }}
+          images: ${{ steps.selection.outputs.image_ref }}
           # The sha tag gets an explicit priority ABOVE raw's default (200):
           # `steps.meta.outputs.version` — which becomes this workflow's
           # image_tag output and the host .env's IMAGE_TAG — is the
@@ -168,13 +318,14 @@ jobs:
           # Registry cache, not type=gha: a single image per repo, and the GHA
           # cache is scoped per-repo anyway, which a shared reusable workflow
           # would silently thrash across callers.
-          cache-from: type=registry,ref=${{ inputs.image }}:buildcache
-          cache-to: type=registry,ref=${{ inputs.image }}:buildcache,mode=max
+          cache-from: type=registry,ref=${{ steps.selection.outputs.image_ref }}:buildcache
+          cache-to: type=registry,ref=${{ steps.selection.outputs.image_ref }}:buildcache,mode=max
 
   deploy:
     name: Deploy ${{ inputs.app_name }}
     needs: [build]
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_labels != '' && fromJSON(inputs.runner_labels) || 'ubuntu-latest' }}
+    timeout-minutes: ${{ inputs.deploy_timeout_minutes }}
     permissions:
       contents: read
       packages: read
@@ -277,6 +428,7 @@ jobs:
           host-key: ${{ secrets.host_key }}
 
       - name: Deploy via SSH
+        id: deploy
         env:
           # GITHUB_TOKEN's packages:read scope is enough for `docker pull` from
           # the caller's GHCR images, and it expires when the run ends — no
@@ -292,8 +444,35 @@ jobs:
           HOST_PORT: ${{ inputs.host_port }}
           ENV_PAYLOAD: ${{ secrets.env_payload }}
           DEPLOY_HOST: ${{ secrets.deploy_host || 'evergreen.thehfhotel.org' }}
+          IMAGE: ${{ inputs.image }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          IMAGE_REGISTRY_SECRET: ${{ secrets.image_registry }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
+
+          # The build job's own "Resolve image registry" step already refuses
+          # a bad image/image_name/image_registry combination — but that step
+          # lives in the `build` job, which `force_deploy` SKIPS entirely (see
+          # `if: ${{ !inputs.force_deploy }}` on that job). With force_deploy
+          # set, those checks never run, and this job would otherwise sail
+          # past straight to the ssh call below with, e.g., `image_registry`
+          # set but `image_name` empty. Replicate the same fail-closed checks
+          # here, before anything touches the host, using the raw
+          # inputs/secrets (not the build job's outputs, which are empty on a
+          # skip regardless of whether the config was actually valid).
+          if [ -n "${IMAGE:-}" ] && [ -n "${IMAGE_NAME:-}" ]; then
+            echo "::error::Both 'image' and 'image_name' inputs are set — pick one. 'image' is the legacy full ref (always GHCR); 'image_name' is the bare app segment that lets this workflow pick the registry."
+            exit 1
+          fi
+          if [ -z "${IMAGE:-}" ] && [ -z "${IMAGE_NAME:-}" ]; then
+            echo "::error::Neither 'image' nor 'image_name' is set — set exactly one. 'image' is the legacy full ref (always GHCR); 'image_name' is the bare app segment that lets this workflow pick the registry."
+            exit 1
+          fi
+          if [ -z "${IMAGE_NAME:-}" ] && [ -n "${IMAGE_REGISTRY_SECRET:-}" ]; then
+            echo "::error::secrets.image_registry is set but inputs.image_name is empty. image_registry only applies on the image_name path."
+            exit 1
+          fi
 
           # A `secrets.SOMETHING` reference that does not exist renders as ""
           # and the variable is still SET, so `set -u` never trips on it. Fail
@@ -327,6 +506,32 @@ jobs:
             mv "$COMPOSE_PATH" docker-compose.yml
           fi
 
+          # Deterministically recompute the registry here, unconditionally,
+          # from the same inputs/secrets the build job used — never from a
+          # build job OUTPUT. On the image_registry path, a job output that
+          # equals a secret's value is redacted to an EMPTY string by GitHub
+          # ("Skip output {output.Key} since it may contain secret."), so a
+          # value threaded through `needs.build.outputs.*` would come back
+          # empty on every SUCCESSFUL build using the estate's own registry,
+          # not only on a force_deploy skip — silently dropping
+          # IMAGE_REGISTRY from the host .env on exactly the runs where it
+          # matters most. Legacy `image` callers never set IMAGE_NAME, so
+          # REGISTRY stays empty for them and nothing new is written below.
+          REGISTRY=""
+          if [ -n "${IMAGE_NAME:-}" ]; then
+            if [ -n "${IMAGE_REGISTRY_SECRET:-}" ]; then
+              REGISTRY="$IMAGE_REGISTRY_SECRET"
+            else
+              REGISTRY="ghcr.io/$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+            fi
+          fi
+          # Expose for the Deploy summary step below — REGISTRY may equal a
+          # secret (image_registry), so GitHub redacts it in logs/summaries
+          # automatically wherever it's later printed; this output is only
+          # consumed to build the fully-qualified image reference, never
+          # echoed on its own.
+          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
+
           # Validate the caller's env block BEFORE it becomes a prod .env.
           # Never echo a line — it holds secrets; report the line number only.
           if [ -n "${ENV_PAYLOAD:-}" ]; then
@@ -351,6 +556,9 @@ jobs:
           {
             printf 'IMAGE_TAG=%s\n' "$IMAGE_TAG"
             printf 'HOST_PORT=%s\n' "$HOST_PORT"
+            if [ -n "${REGISTRY:-}" ]; then
+              printf 'IMAGE_REGISTRY=%s\n' "$REGISTRY"
+            fi
             if [ -n "${ENV_PAYLOAD:-}" ]; then
               printf '%s\n' "$ENV_PAYLOAD"
             fi
@@ -379,6 +587,19 @@ jobs:
 
       - name: Deploy summary
         run: |
+          # Build the fully-qualified image from this job's own recomputed
+          # REGISTRY (steps.deploy.outputs.registry), never from a build job
+          # output — see the "Deploy via SSH" step for why those are
+          # unreliable on the image_registry path. Legacy `image` callers
+          # have no IMAGE_NAME/REGISTRY at all, so they fall through to the
+          # legacy full ref unchanged.
+          if [ -n "${IMAGE_NAME:-}" ]; then
+            if [ -n "${REGISTRY:-}" ]; then
+              IMAGE="${REGISTRY}/${IMAGE_NAME}"
+            else
+              IMAGE="${IMAGE_NAME}"
+            fi
+          fi
           {
             echo "## ${APP_NAME} deployed"
             echo ""
@@ -387,5 +608,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           APP_NAME: ${{ inputs.app_name }}
-          IMAGE: ${{ inputs.image }}
+          IMAGE: ${{ inputs.image || inputs.image_name }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          REGISTRY: ${{ steps.deploy.outputs.registry }}
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}

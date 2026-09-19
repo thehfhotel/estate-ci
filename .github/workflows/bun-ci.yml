@@ -31,15 +31,31 @@ on:
         type: boolean
         default: true
       runs-on:
-        description: "Runner label."
+        description: "Runner label. Ignored when runner_labels is set."
         required: false
         type: string
         default: "ubuntu-latest"
+      runner_labels:
+        description: >-
+          JSON array of runner labels, e.g. '["self-hosted","<box-label>"]'. When
+          set (non-empty), this replaces `runs-on` entirely via `fromJSON` —
+          the estate's private repos pass this instead of `runs-on` so the
+          job lands on the self-hosted fleet. Left empty, `runs-on` still
+          decides, so every existing caller is unaffected.
+        required: false
+        type: string
+        default: ""
+      timeout-minutes:
+        description: "Job timeout-minutes."
+        required: false
+        type: number
+        default: 15
 
 jobs:
   check:
     name: Bun checks
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ inputs.runner_labels != '' && fromJSON(inputs.runner_labels) || inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
     defaults:
