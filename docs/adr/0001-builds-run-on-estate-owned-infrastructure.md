@@ -6,14 +6,13 @@ Status: Accepted, 2026-09-20.
 
 The estate's GitHub organization is on the Free plan: 2,000 private-repo
 Actions minutes/month and 500 MB of GitHub Packages storage, both included;
-usage past that is billed per-minute / per-GB. The estate now runs on the
-order of twenty private repositories, most with a CI workflow (bun-ci.yml or
-equivalent) gating a deploy on every push to their default branch, plus a
-handful of scheduled security/health jobs. Measured against that cadence,
-staying on GitHub-hosted runners and GHCR storage at the estate's actual
-build frequency would cost on the order of **$200/month** once the included
-minutes and storage are exhausted — against an owner-set cap of ฿200/month
-for anything GitHub-billed.
+usage past that is billed per-minute / per-GB. The estate runs a number of
+private repositories, most with a CI workflow (bun-ci.yml or equivalent)
+gating a deploy on every push to their default branch, plus a handful of
+scheduled security/health jobs. Measured against that cadence, staying on
+GitHub-hosted runners and GHCR storage would run well past the Free plan's
+included minutes and Packages storage — against an owner-set monthly cap on
+anything GitHub-billed.
 
 Two levers bring that to $0: run the builds themselves somewhere the estate
 already pays for (compute that exists regardless, rather than metered

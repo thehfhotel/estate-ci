@@ -10,6 +10,23 @@
 # IDENTICAL absolute path inside the container as on the host, because
 # container actions and `uses: docker://` steps run as sibling containers
 # via the mounted docker socket and see host paths, not container paths.
+#
+# Recorded drift (deliberate, not an oversight): the box copy at
+# /sata/hf-ci/runner/ running the actual `hf-ci-runner` compose project is
+# NOT byte-identical to this template. It differs in exactly these ways:
+#   - `image:` is tagged `hf-runner:<YYYYMMDD>` (the date the image was
+#     built on the box), not `hf-runner:local`.
+#   - `group_add: ["<docker gid>"]` is added — a bare numeric GID with no
+#     org/host meaning on its own, so it's left out of this public template
+#     rather than baked in; entrypoint.sh maps the socket's GID generically
+#     regardless, so this is belt-and-braces, not load-bearing.
+#   - `TZ` is pinned to a fixed zone instead of left at the `${TZ:-UTC}`
+#     default below.
+#   - the box runs this as MULTIPLE services (one per runner, e.g.
+#     `runner-1`/`runner-2`) under one compose project, each with its own
+#     `state-N`/`work-N` host directories and RUNNER_NAME — this file
+#     defines a single `runner` service as the template to copy per
+#     instance, per the instructions in README.md.
 
 services:
   runner:

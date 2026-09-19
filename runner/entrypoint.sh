@@ -33,6 +33,16 @@ if [ -n "${RUNNER_TOOL_CACHE:-}" ]; then
   chown -R runner:runner "${RUNNER_TOOL_CACHE}"
 fi
 
+# The job work dir (passed to config.sh --work below) is bind-mounted from
+# the host and, like RUNNER_HOME/RUNNER_TOOL_CACHE above, lands root-owned
+# (or is created root-owned by Docker if the host path didn't exist yet).
+# Without this, the runner user can't create its <owner>/<repo>/<repo> job
+# tree and every job fails at checkout.
+if [ -n "${RUNNER_WORKDIR:-}" ]; then
+  mkdir -p "${RUNNER_WORKDIR}"
+  chown runner:runner "${RUNNER_WORKDIR}"
+fi
+
 cd "${RUNNER_HOME}"
 
 # A runner that already registered (.runner exists) just needs to run — never
@@ -57,7 +67,7 @@ if [ ! -f "${RUNNER_HOME}/.runner" ]; then
   # `runner` to it.
   if [ -S /var/run/docker.sock ]; then
     SOCK_GID="$(stat -c '%g' /var/run/docker.sock)"
-    GRP="$(getent group "${SOCK_GID}" | cut -d: -f1)"
+    GRP="$(getent group "${SOCK_GID}" | cut -d: -f1 || true)"
     if [ -z "${GRP}" ]; then
       GRP=dockerhost
       groupadd -g "${SOCK_GID}" "${GRP}"
@@ -90,7 +100,7 @@ fi
 # ensured on this path too, not only right before the one-time config.sh call.
 if [ -S /var/run/docker.sock ]; then
   SOCK_GID="$(stat -c '%g' /var/run/docker.sock)"
-  GRP="$(getent group "${SOCK_GID}" | cut -d: -f1)"
+  GRP="$(getent group "${SOCK_GID}" | cut -d: -f1 || true)"
   if [ -z "${GRP}" ]; then
     GRP=dockerhost
     groupadd -g "${SOCK_GID}" "${GRP}"

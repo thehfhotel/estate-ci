@@ -31,6 +31,18 @@ copy it per runner and fill in the host paths and env values for your own
 box (state dir, work dir, tool cache dir must all be host paths; `RUNNER_NAME`
 and the service/container name must be unique per instance).
 
+Every value below is a compose *substitution* (`${VAR:?...}`), resolved by
+`docker compose` itself before the container ever starts — not a container
+env var read by the entrypoint at runtime. That means `docker compose up`
+fails immediately with a "variable is not set" error unless these are
+available to compose, which in practice means a `.env` file sitting next to
+`compose.yml` (compose loads it automatically) or the vars already exported
+in your shell. Put `RUNNER_URL`, `RUNNER_NAME`, `RUNNER_GROUP`,
+`RUNNER_LABELS`, `RUNNER_WORKDIR`, `RUNNER_STATE_DIR`, `RUNNER_TOOLCACHE_DIR`
+and `TZ` in that `.env` (mode `0600` if any of them are sensitive on your
+box — none are secrets by default, but treat host paths as you would any
+other local config).
+
 The container expects these env vars (all required unless noted):
 
 | Var | Meaning |
@@ -39,7 +51,7 @@ The container expects these env vars (all required unless noted):
 | `RUNNER_NAME` | This runner's registered name. Must be unique per org/group. |
 | `RUNNER_GROUP` | Runner group to join. |
 | `RUNNER_LABELS` | Comma-separated custom labels (in addition to the automatic `self-hosted,linux,x64`). |
-| `RUNNER_WORKDIR` | Absolute path used as `--work`. Bind-mount the *same* absolute path from the host so container actions and `uses: docker://` (which run as sibling containers via the mounted docker socket) can see the job's files. |
+| `RUNNER_WORKDIR` | Absolute path used as `--work`. Bind-mount the *same* absolute path from the host so container actions and `uses: docker://` (which run as sibling containers via the mounted docker socket) can see the job's files. The entrypoint creates this directory and `chown`s it to the runner user if it doesn't already own it — the host-side bind-mount target is otherwise typically root-owned (or created root-owned by Docker), which would fail every job at checkout. |
 | `RUNNER_TOOL_CACHE` | Optional. If set, exported and used as the runner's tool cache directory — bind-mount it from the host so `actions/setup-*` downloads survive a container recreate. |
 
 Persistent identity: bind-mount a per-runner directory at `/runner`. On

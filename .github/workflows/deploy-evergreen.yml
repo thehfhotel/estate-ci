@@ -167,9 +167,17 @@ jobs:
       contents: read
       packages: write
     outputs:
+      # image_ref and registry are deliberately NOT exposed here. On the
+      # image_registry path, steps.selection.outputs.registry (and image_ref,
+      # which contains it) equal the `image_registry` secret's value —
+      # GitHub redacts a job output that equals a secret to an EMPTY string
+      # ("Skip output {output.Key} since it may contain secret."), so this
+      # job's outputs would come back empty on every successful build that
+      # uses the estate's own registry, not just on a force_deploy skip. The
+      # deploy job recomputes the registry itself instead, from the same
+      # inputs/secrets this job used, so it never depends on a value GitHub
+      # may silently drop.
       image_tag: ${{ steps.meta.outputs.version }}
-      image_ref: ${{ steps.selection.outputs.image_ref }}
-      registry: ${{ steps.selection.outputs.registry }}
     steps:
       # Same refusal as the deploy job's, but BEFORE anything is pushed: on a
       # pull_request-triggered caller this job would otherwise build the PR's
@@ -420,6 +428,7 @@ jobs:
           host-key: ${{ secrets.host_key }}
 
       - name: Deploy via SSH
+        id: deploy
         env:
           # GITHUB_TOKEN's packages:read scope is enough for `docker pull` from
           # the caller's GHCR images, and it expires when the run ends — no
@@ -435,10 +444,6 @@ jobs:
           HOST_PORT: ${{ inputs.host_port }}
           ENV_PAYLOAD: ${{ secrets.env_payload }}
           DEPLOY_HOST: ${{ secrets.deploy_host || 'evergreen.thehfhotel.org' }}
-          # The build job's `registry` output is empty when it was SKIPPED
-          # (force_deploy) even on the image_name path — recompute it below
-          # rather than lose IMAGE_REGISTRY on a re-roll.
-          REGISTRY: ${{ needs.build.outputs.registry }}
           IMAGE: ${{ inputs.image }}
           IMAGE_NAME: ${{ inputs.image_name }}
           IMAGE_REGISTRY_SECRET: ${{ secrets.image_registry }}
@@ -501,20 +506,31 @@ jobs:
             mv "$COMPOSE_PATH" docker-compose.yml
           fi
 
-          # On the image_name path, deterministically recompute the registry
-          # when the build job was skipped (force_deploy) instead of losing
-          # IMAGE_REGISTRY on a re-roll — the host compose file requires it
-          # (${IMAGE_REGISTRY:?IMAGE_REGISTRY missing}) and a missing line
-          # here would not fail this CI run, only wedge the container on the
-          # host. Legacy `image` callers never set IMAGE_NAME, so REGISTRY
-          # stays empty for them and nothing new is written below.
-          if [ -z "${REGISTRY:-}" ] && [ -n "${IMAGE_NAME:-}" ]; then
+          # Deterministically recompute the registry here, unconditionally,
+          # from the same inputs/secrets the build job used — never from a
+          # build job OUTPUT. On the image_registry path, a job output that
+          # equals a secret's value is redacted to an EMPTY string by GitHub
+          # ("Skip output {output.Key} since it may contain secret."), so a
+          # value threaded through `needs.build.outputs.*` would come back
+          # empty on every SUCCESSFUL build using the estate's own registry,
+          # not only on a force_deploy skip — silently dropping
+          # IMAGE_REGISTRY from the host .env on exactly the runs where it
+          # matters most. Legacy `image` callers never set IMAGE_NAME, so
+          # REGISTRY stays empty for them and nothing new is written below.
+          REGISTRY=""
+          if [ -n "${IMAGE_NAME:-}" ]; then
             if [ -n "${IMAGE_REGISTRY_SECRET:-}" ]; then
               REGISTRY="$IMAGE_REGISTRY_SECRET"
             else
               REGISTRY="ghcr.io/$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
             fi
           fi
+          # Expose for the Deploy summary step below — REGISTRY may equal a
+          # secret (image_registry), so GitHub redacts it in logs/summaries
+          # automatically wherever it's later printed; this output is only
+          # consumed to build the fully-qualified image reference, never
+          # echoed on its own.
+          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
 
           # Validate the caller's env block BEFORE it becomes a prod .env.
           # Never echo a line — it holds secrets; report the line number only.
@@ -571,6 +587,19 @@ jobs:
 
       - name: Deploy summary
         run: |
+          # Build the fully-qualified image from this job's own recomputed
+          # REGISTRY (steps.deploy.outputs.registry), never from a build job
+          # output — see the "Deploy via SSH" step for why those are
+          # unreliable on the image_registry path. Legacy `image` callers
+          # have no IMAGE_NAME/REGISTRY at all, so they fall through to the
+          # legacy full ref unchanged.
+          if [ -n "${IMAGE_NAME:-}" ]; then
+            if [ -n "${REGISTRY:-}" ]; then
+              IMAGE="${REGISTRY}/${IMAGE_NAME}"
+            else
+              IMAGE="${IMAGE_NAME}"
+            fi
+          fi
           {
             echo "## ${APP_NAME} deployed"
             echo ""
@@ -579,5 +608,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           APP_NAME: ${{ inputs.app_name }}
-          IMAGE: ${{ needs.build.outputs.image_ref || inputs.image || inputs.image_name }}
+          IMAGE: ${{ inputs.image || inputs.image_name }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          REGISTRY: ${{ steps.deploy.outputs.registry }}
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
