@@ -13,6 +13,19 @@
 # the container and pointing ACTIONS_RUNNER_HOOK_JOB_COMPLETED at its
 # in-container path — see runner/README.md.
 #
+# Some job steps run containerized as root (e.g. `docker run
+# mcr.microsoft.com/playwright ...` mounting the workspace, or a
+# `container: semgrep/semgrep` job) and leave root-owned files behind. This
+# hook runs as the unprivileged runner user, so a plain `rm -rf` on those
+# files silently no-ops (`|| true` swallows the Permission denied), leaving
+# the leftover tree for the next job's checkout to choke on. If the runner
+# container has a docker socket mounted in (see "Docker access" in
+# runner/README.md), the wipe below runs as root inside a throwaway sibling
+# container instead, so it can delete anything a previous root-run step
+# created. Falls back to a plain `rm -rf` if docker isn't available. The
+# image is configurable via HOOK_WIPE_IMAGE (default alpine:3.20) — pin it
+# and pre-pull it on your box so the hook never blocks on an image pull.
+#
 # Persistent runners also keep the SAME $HOME across jobs, so any credential
 # a job wrote there — a deploy SSH private key under ~/.ssh, a `docker login`
 # token in ~/.docker/config.json, `gh auth login` state, a git credential
@@ -40,9 +53,26 @@ else
   RUNNER_WORK_PREFIX="${RUNNER_WORK_PREFIX:-}"
 fi
 
+HOOK_WIPE_IMAGE="${HOOK_WIPE_IMAGE:-alpine:3.20}"
+
 if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -n "${RUNNER_WORK_PREFIX}" ] && [ "${GITHUB_WORKSPACE#"$RUNNER_WORK_PREFIX"}" != "$GITHUB_WORKSPACE" ]; then
-  rm -rf -- "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* 2>/dev/null || true
-  echo "job-completed hook: cleared GITHUB_WORKSPACE ${GITHUB_WORKSPACE}"
+  wipe_outcome=""
+  if command -v docker >/dev/null 2>&1; then
+    if docker run --rm -v "${GITHUB_WORKSPACE}:/w" "$HOOK_WIPE_IMAGE" \
+         sh -c 'rm -rf -- /w/* /w/.[!.]* 2>/dev/null; true' >/dev/null 2>&1
+    then
+      wipe_outcome="docker-wipe ok"
+    else
+      # docker is present but the containerized wipe itself failed (e.g.
+      # image pull blocked) — still attempt a plain rm as best effort.
+      rm -rf -- "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* 2>/dev/null || true
+      wipe_outcome="fallback (docker wipe failed)"
+    fi
+  else
+    rm -rf -- "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* 2>/dev/null || true
+    wipe_outcome="fallback (docker unavailable)"
+  fi
+  echo "job-completed hook: cleared GITHUB_WORKSPACE ${GITHUB_WORKSPACE} (${wipe_outcome})"
 else
   echo "job-completed hook: GITHUB_WORKSPACE (${GITHUB_WORKSPACE:-unset}) not under RUNNER_WORK_PREFIX (${RUNNER_WORK_PREFIX:-unset}) — skipped"
 fi
