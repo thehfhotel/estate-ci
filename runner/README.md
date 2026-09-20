@@ -165,6 +165,25 @@ the kernel scheduler favors production containers first whenever the host is
 actually saturated, while a quiet host still lets the runner use as much CPU
 as `cpus` allows.
 
+### A shared cache root across runners
+
+Bind-mount one directory — the *identical* absolute path — into every
+runner container on a box (e.g. `/srv/ci-cache:/srv/ci-cache`), export
+that same path as an env var such as `HF_CI_CACHE` on each runner, and
+workflows can derive per-tool cache locations from it (`CARGO_HOME`,
+`CARGO_TARGET_DIR`, `npm_config_cache`, a buildx `BUILDX_CONFIG` state
+dir, …) so language/package/layer caches persist across jobs and across
+which runner in the pool happens to pick a job up, instead of being
+downloaded or rebuilt cold every time. The identical-path requirement is
+the same one `RUNNER_WORKDIR` calls out above: DooD (`container:` jobs,
+or a job's own `docker run -v ...`) resolves any bind-mount source path
+on the **host** daemon, so a runner-relative or per-runner path would
+silently mount an empty directory in the sibling container rather than
+sharing anything. Keep the cache root outside `RUNNER_WORKDIR` and outside
+`$HOME` so the job-completed hook above — which wipes both — never
+touches it, and give it its own retention/pruning job; nothing here does
+that for you.
+
 ### Docker daemon DNS for a private registry
 
 If your registry lives at a name that only resolves through your own DNS
