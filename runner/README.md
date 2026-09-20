@@ -115,6 +115,13 @@ The script is deliberately non-fatal (`exit 0` on every path, even a failed
 `rm`) — a hook that fails would fail the job it runs after, which is worse
 than an occasionally-stale workspace.
 
+A containerized job step that runs as root (e.g. a `docker run ...`-mounted
+tool, or a `container:` job) can leave root-owned files that the hook's own
+unprivileged `rm -rf` can't remove, so when a docker socket is mounted in
+(see "Docker access" above) the wipe instead runs as root inside a
+throwaway `HOOK_WIPE_IMAGE` container (default `alpine:3.20`, override via
+env var), falling back to the plain `rm -rf` if docker isn't available.
+
 Persistence cuts both ways: the same `$HOME` also carries over between jobs,
 so the hook additionally sweeps well-known credential locations there every
 time — the whole of `~/.ssh`, `~/.docker/config.json`, `~/.config/gh`,
