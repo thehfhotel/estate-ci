@@ -115,6 +115,14 @@ The script is deliberately non-fatal (`exit 0` on every path, even a failed
 `rm`) — a hook that fails would fail the job it runs after, which is worse
 than an occasionally-stale workspace.
 
+Persistence cuts both ways: the same `$HOME` also carries over between jobs,
+so the hook additionally sweeps well-known credential locations there every
+time — the whole of `~/.ssh`, `~/.docker/config.json`, `~/.config/gh`,
+`~/.netrc`, `~/.git-credentials`, `~/.aws` and `~/.kube` (whichever exist) —
+so a deploy SSH key, a `docker login` token, `gh auth login` state, or a
+cloud CLI config a job wrote there never survives to be read by the next job
+on this runner.
+
 Before wiping anything, the script checks that `$GITHUB_WORKSPACE` sits under
 `RUNNER_WORK_PREFIX`. That variable is optional: left unset, it defaults to
 the directory two levels above `$GITHUB_WORKSPACE` itself (a job's workspace

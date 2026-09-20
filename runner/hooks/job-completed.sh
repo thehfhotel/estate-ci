@@ -13,6 +13,13 @@
 # the container and pointing ACTIONS_RUNNER_HOOK_JOB_COMPLETED at its
 # in-container path — see runner/README.md.
 #
+# Persistent runners also keep the SAME $HOME across jobs, so any credential
+# a job wrote there — a deploy SSH private key under ~/.ssh, a `docker login`
+# token in ~/.docker/config.json, `gh auth login` state, a git credential
+# helper file, a cloud CLI config — would otherwise sit there for the NEXT
+# job on this runner to read. Sweep the well-known locations unconditionally
+# after every job too, regardless of workflow content.
+#
 # Must NEVER fail the job: always exit 0, regardless of what happens above.
 set -u
 
@@ -39,5 +46,33 @@ if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -n "${RUNNER_WORK_PREFIX}" ] && [ "${GITH
 else
   echo "job-completed hook: GITHUB_WORKSPACE (${GITHUB_WORKSPACE:-unset}) not under RUNNER_WORK_PREFIX (${RUNNER_WORK_PREFIX:-unset}) — skipped"
 fi
+
+secret_removed_count=0
+
+if [ -n "${HOME:-}" ] && [ -d "${HOME}" ]; then
+  # Whole ~/.ssh contents, not just a private key file — known_hosts is
+  # re-created by whichever job next needs one, so nothing under here is
+  # worth keeping between jobs.
+  if [ -d "${HOME}/.ssh" ] && [ -n "$(ls -A "${HOME}/.ssh" 2>/dev/null)" ]; then
+    rm -rf -- "${HOME}/.ssh"/* "${HOME}/.ssh"/.[!.]* 2>/dev/null || true
+    secret_removed_count=$((secret_removed_count + 1))
+  fi
+
+  for p in \
+    "${HOME}/.docker/config.json" \
+    "${HOME}/.config/gh" \
+    "${HOME}/.netrc" \
+    "${HOME}/.git-credentials" \
+    "${HOME}/.aws" \
+    "${HOME}/.kube"
+  do
+    if [ -e "$p" ]; then
+      rm -rf -- "$p" 2>/dev/null || true
+      secret_removed_count=$((secret_removed_count + 1))
+    fi
+  done
+fi
+
+echo "job-completed hook: removed ${secret_removed_count} secret path(s) from HOME (${HOME:-unset})"
 
 exit 0
