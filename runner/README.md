@@ -83,7 +83,82 @@ job.
   registered between jobs, rather than being torn down and re-registered per
   job. That trades per-job filesystem isolation (illusory anyway with a
   shared docker socket) for not needing a long-lived registration PAT sitting
-  on disk and a rebuild cadence to keep up with runner releases.
+  on disk and a rebuild cadence to keep up with runner releases. The cost of
+  that trade — a job's checkout can leak into the next job's on the same
+  runner — is what the job-completed hook below exists to pay down.
 - The docker socket mount means any job on this runner can, in effect, do
   anything Docker can do on the host. Only run this for repos you already
   trust with equivalent access — never for a public repo (see above).
+
+## Workspace hygiene: the job-completed hook
+
+Because runners are persistent (see above), the same `work-N` directory is
+reused, unwiped, across every job that lands on it. A job that does a sparse
+or otherwise narrowed checkout leaves that narrowed tree sitting there for
+the *next* job of the same repo on the same runner — which then fails at a
+step like "no package.json" or "no Dockerfile" for a reason that has nothing
+to do with its own change, and everything to do with the previous job.
+
+`hooks/job-completed.sh` fixes this by wiping `$GITHUB_WORKSPACE` after every
+job, unconditionally, so the next job always starts from a clean checkout.
+Wire it up with the runner's [`ACTIONS_RUNNER_HOOK_JOB_COMPLETED`](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job)
+env var, pointed at the script's path *inside the container*:
+
+```yaml
+    environment:
+      ACTIONS_RUNNER_HOOK_JOB_COMPLETED: /runner-hooks/job-completed.sh
+    volumes:
+      - ./hooks:/runner-hooks:ro
+```
+
+The script is deliberately non-fatal (`exit 0` on every path, even a failed
+`rm`) — a hook that fails would fail the job it runs after, which is worse
+than an occasionally-stale workspace.
+
+Before wiping anything, the script checks that `$GITHUB_WORKSPACE` sits under
+`RUNNER_WORK_PREFIX`. That variable is optional: left unset, it defaults to
+the directory two levels above `$GITHUB_WORKSPACE` itself (a job's workspace
+is normally `<work-dir>/<repo>/<repo>`, so two levels up recovers
+`<work-dir>`), which is a no-op guard on an ordinary single-purpose runner.
+Set `RUNNER_WORK_PREFIX` explicitly — to the host-path prefix shared by every
+`RUNNER_WORKDIR` on your box — when several runners or repos share one host
+and you want the hook to refuse to touch anything outside a known work root.
+
+## Scaling past one runner
+
+### The `heavy` label lane
+
+`RUNNER_LABELS` is free-form, so a fleet of otherwise-identical runners can
+carve out one lane for jobs that need more resources than you want every job
+to have by default: give exactly one runner an extra `heavy` label (e.g.
+`RUNNER_LABELS: <site>,docker,heavy`) and target it from the workflow side
+with `runs-on: [self-hosted, <site>, heavy]`. Ordinary jobs keep matching on
+`[self-hosted, <site>]` and land on whichever runner in that group is free,
+never the heavy one specifically — `heavy` only *adds* a runner to the pool
+that can take heavy jobs, it doesn't remove it from the pool for everything
+else, unless you also give it a label combination that excludes it from the
+plain lane.
+
+### `cpu_shares` for production priority
+
+When a runner container shares a host with production containers, a
+CPU-hungry build can starve them under contention even with a `cpus` limit
+set (`cpus` caps a container's ceiling; it doesn't set its priority relative
+to others). Docker's `cpu_shares` (cgroup CPU weight, default `1024`) is the
+knob for that: give runner containers a share below `1024` — e.g. `256` — so
+the kernel scheduler favors production containers first whenever the host is
+actually saturated, while a quiet host still lets the runner use as much CPU
+as `cpus` allows.
+
+### Docker daemon DNS for a private registry
+
+If your registry lives at a name that only resolves through your own DNS
+(for example, a mesh-VPN "MagicDNS"-style private hostname rather than
+public DNS), a plain `docker pull`/`docker build --pull` from *inside* a
+container on Docker's default bridge network can fail to resolve it — the
+default bridge does not inherit the host's resolver. Point the docker daemon
+itself at a resolver that knows that name via the `dns` key in
+`/etc/docker/daemon.json` (or the container-runtime equivalent), then restart
+the daemon; this affects every container on the default bridge network on
+that host, including sibling containers a job builds via the mounted docker
+socket.

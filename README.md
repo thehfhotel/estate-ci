@@ -9,7 +9,7 @@ near-copy of `deploy.yml`.
 | `.github/workflows/deploy-evergreen.yml` | Reusable — buildx build + push to GHCR, then forced-command SSH deploy over the cloudflared tunnel. |
 | `.github/workflows/bun-ci.yml` | Reusable — `bun install --frozen-lockfile` → typecheck → test → build, each conditional on the script existing. |
 | `.github/actions/evergreen-ssh/` | Composite — pinned, checksum-verified cloudflared plus the deploy key and `known_hosts`. |
-| `runner/` | Generic self-hosted runner image (`Dockerfile` + `entrypoint.sh` + `compose.yml`) built and run on estate-owned infrastructure. Org-specific values (URL, group, labels, work dir, host paths) are env vars, never baked in. See `runner/README.md`. |
+| `runner/` | Generic self-hosted runner image (`Dockerfile` + `entrypoint.sh` + `compose.yml` + `hooks/job-completed.sh`) built and run on estate-owned infrastructure. Org-specific values (URL, group, labels, work dir, host paths) are env vars, never baked in. See `runner/README.md`. |
 
 Why it exists: the estate had accumulated fourteen near-copies of the same
 deploy workflow. Each copy carried its own version of the cloudflared fetch,
