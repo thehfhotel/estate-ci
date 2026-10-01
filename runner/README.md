@@ -24,6 +24,22 @@ The base image tag is pinned in the `FROM` line; bump it there when you want
 a newer runner floor (self-update keeps the running binary current between
 rebuilds regardless — see the comment in the Dockerfile).
 
+### Preinstalled tools
+
+Besides the Docker CLI, buildx and compose, the image carries two CLIs that
+jobs would otherwise download on every run, each version-pinned and
+sha256-verified at build time (`ARG`s at the top of the relevant `RUN` in the
+`Dockerfile`; linux/amd64 only):
+
+| Tool | Where | Used by |
+|---|---|---|
+| `cloudflared` | `/usr/local/bin/cloudflared` | `.github/actions/evergreen-ssh`, which uses the preinstalled binary when its version equals the action's pin and otherwise downloads the pinned build (60 s limit per attempt) |
+| `trivy` | `/usr/local/bin/trivy` | scan steps that call the binary directly instead of restoring it through the Actions cache |
+
+To bump either one, change the `ARG` pair in the `Dockerfile`, and for
+`cloudflared` the matching pin in the action, then rebuild and recreate the
+runners (an image rebuild never touches a running container).
+
 ## Run
 
 `compose.yml` in this directory is a generic template for one instance —
@@ -111,6 +127,9 @@ env var, pointed at the script's path *inside the container*:
       - ./hooks:/runner-hooks:ro
 ```
 
+After the wipe and the credential sweep the same hook runs the size-gated
+cache prune described under "Cache pruning" below.
+
 The script is deliberately non-fatal (`exit 0` on every path, even a failed
 `rm`) — a hook that fails would fail the job it runs after, which is worse
 than an occasionally-stale workspace.
@@ -181,8 +200,89 @@ on the **host** daemon, so a runner-relative or per-runner path would
 silently mount an empty directory in the sibling container rather than
 sharing anything. Keep the cache root outside `RUNNER_WORKDIR` and outside
 `$HOME` so the job-completed hook above — which wipes both — never
-touches it, and give it its own retention/pruning job; nothing here does
-that for you.
+touches it. The hook's cache prune (next section) keeps it bounded.
+
+If a cache root (or any one `<repo>` directory under it) lives on a
+different disk than its siblings — for example one repo's cache bind-mounted
+from a faster device over its path under the shared root — nothing else
+changes: workflows still use the same paths, and the prune measures free
+space per filesystem. Mounts made on the host AFTER a runner container was
+created do not appear in that container, so recreate the runners
+(`docker compose up -d --force-recreate`) after adding such a mount.
+
+## Cache pruning
+
+Persistent caches under `$HF_CI_CACHE` grow without bound: every commit, lockfile
+bump or toolchain change opens a new set of cargo artifacts under new hashes,
+and nothing ever deletes the old ones. The job-completed hook prunes them. It
+is enabled when `HF_CI_CACHE` is set in the runner's environment, and costs one
+`df` per cache root per job unless a prune is actually due.
+
+**What it prunes.** Every `$HF_CI_CACHE/<repo>/target*` directory is treated as
+a cargo target dir. Per profile directory (`debug`, `release`, ...):
+
+- `deps`, `build` and `.fingerprint`: entries are named `<stem>-<16 hex>[.ext]`.
+  Variants are grouped by stem and the newest K per stem are kept; every file or
+  directory of an older variant is removed. "Newest" is by mtime, so the variant
+  a build in flight needs is always among the kept ones.
+- `incremental/<crate>-<hash>`: the newest K-1 per crate (at least 1) are kept.
+- `cargo-timings` (older than 1 day), `tmp` and `sqlx-prepare-check` (older than
+  7 days) entries under the target dir (`HF_CI_PRUNE_JUNK` to change the list).
+- Nothing modified in the last `HF_CI_PRUNE_MIN_AGE_MIN` minutes (60) is touched.
+
+**Levels, per filesystem.** The level is decided PER CACHE ROOT from the free
+space of the filesystem that root lives on (`df`), not from one global figure:
+
+| Level | When | Keep per stem | Also |
+|---|---|---|---|
+| 0 | at least 40 GB free | | once every 24 h a level-1 sweep runs anyway (stamp file `$HF_CI_CACHE/.prune-stamp`) |
+| 1 | under 40 GB free | 3 | `docker volume prune -f` |
+| 2 | under 20 GB free | 2 | all `incremental` dirs removed |
+| 3 | under 10 GB free | 1 | every own-crate artifact set removed (executables at the top of the profile dir, `test_*`), and the `test-backend.lock` guard is ignored |
+
+The thresholds are `HF_CI_PRUNE_L1_GB`/`L2_GB`/`L3_GB`, the keep counts
+`HF_CI_PRUNE_K1`/`K2`/`K3`. A disk that also hosts production workloads should
+keep the defaults or raise them: pruning starts early enough that the cache can
+never be what fills it.
+
+**Safety rules.**
+
+- A root whose `<repo>/test-backend.lock` is held (a test job holds it for its
+  whole compile and test) is skipped, except at level 3. The prune holds the
+  lock itself while it deletes in that repo, so a test job cannot start
+  mid-delete.
+- `docker volume prune -f` removes only anonymous volumes on Docker 23 or
+  newer; on an older daemon it would also remove unused NAMED volumes, so the
+  hook refuses to run it there. Running volumes are never touched.
+- Single instance, bounded: the prune runs as root in ONE detached sibling
+  container named `hf-ci-prune` (so a second launch fails fast while one runs),
+  at idle I/O priority, with a 30-minute hard timeout. Root is required because
+  a job that builds inside a `container:` leaves a root-owned target dir that the
+  runner user cannot delete. The container image is `HF_CI_PRUNE_IMAGE`, or by
+  default the image the runner itself runs (it needs bash, GNU find/awk, flock
+  and the Docker CLI). Without a usable image it falls back to an inline
+  best-effort prune as the runner user.
+- It appends one block per run to `$HF_CI_CACHE/prune.log` (free space before
+  and after, what was removed, trimmed at 1 MB) and never fails the job.
+- Kill switch: `HF_CI_PRUNE=0` in the runner environment.
+
+**Dry run.** `PRUNE_DRY_RUN=1` prints, per root, what would be removed (counts,
+sizes, the heaviest stems) and deletes nothing; it also ignores the gate, previews the level-1
+sweep even when the daily stamp is fresh, and `HF_CI_PRUNE_LEVEL=1|2|3` forces a level so you can preview the
+harsher ones. Run it once before arming the hook, on the real cache, in a
+container so nothing else in the hook runs. The hook script can be `source`d
+(its main flow is guarded), so sourcing it and calling `hf_prune_main` is the
+whole test:
+
+```sh
+docker run --rm --user 0:0 --entrypoint bash \
+  -e PRUNE_DRY_RUN=1 -e HF_CI_PRUNE_LEVEL=1 -e HF_CI_CACHE="$HF_CI_CACHE" \
+  -v "$HF_CI_CACHE:$HF_CI_CACHE" -v /var/run/docker.sock:/var/run/docker.sock \
+  <runner-image> -c 'source /path/to/job-completed.sh; hf_prune_main'
+```
+
+Do not run the whole hook on the host to test it: its credential sweep deletes
+the `$HOME` locations listed above.
 
 ### Docker daemon DNS for a private registry
 

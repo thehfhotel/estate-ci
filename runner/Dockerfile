@@ -41,6 +41,33 @@ RUN apt-get update \
         docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
+# Preinstalled, version-pinned and sha256-verified CLI tools that CI jobs
+# otherwise download on every run (an outbound fetch from a busy box has
+# stalled deploy jobs for 8-13 minutes). linux/amd64 only, like the base
+# image tag above. To bump: change the ARG pair, build, and update the
+# matching pin in .github/actions/evergreen-ssh/action.yml (cloudflared) so
+# the action keeps recognising the preinstalled binary.
+#   - cloudflared: the ProxyCommand the evergreen-ssh action uses; the action
+#     skips its own download when `cloudflared --version` already matches.
+#   - trivy: for Trivy scan steps that call the binary directly instead of
+#     letting a setup action restore it through the (slow) Actions cache.
+ARG CLOUDFLARED_VERSION=2026.7.3
+ARG CLOUDFLARED_SHA256=9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17
+ARG TRIVY_VERSION=0.74.0
+ARG TRIVY_SHA256=2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+RUN set -eux; \
+    curl -fsSL --retry 3 --max-time 300 -o /tmp/cloudflared \
+        "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"; \
+    echo "${CLOUDFLARED_SHA256}  /tmp/cloudflared" | sha256sum -c -; \
+    install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared; \
+    curl -fsSL --retry 3 --max-time 300 -o /tmp/trivy.tgz \
+        "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"; \
+    echo "${TRIVY_SHA256}  /tmp/trivy.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/trivy.tgz -C /usr/local/bin trivy; \
+    rm -f /tmp/cloudflared /tmp/trivy.tgz; \
+    cloudflared --version; \
+    trivy --version
+
 # Same trust model as a GitHub-hosted runner: the job user can sudo freely
 # inside its own container, via the base image's own `%sudo` rule (it does
 # `echo "%sudo ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers`, which TRUNCATES

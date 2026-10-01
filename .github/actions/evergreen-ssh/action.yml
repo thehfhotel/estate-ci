@@ -15,8 +15,12 @@ description: >-
   the code.
 
   To bump: change CLOUDFLARED_VERSION below, download the asset, and record its
-  sha256 in CLOUDFLARED_SHA256. Both live here only — one file for the whole
-  estate, not one per repo.
+  sha256 in CLOUDFLARED_SHA256 (and the matching ARGs in runner/Dockerfile, so
+  the preinstalled copy keeps being recognised). Both live here only — one file
+  for the whole estate, not one per repo.
+
+  A preinstalled binary of exactly the pinned version is used as is; otherwise
+  the pinned build is downloaded (60 s limit per attempt) and verified.
 
 inputs:
   ssh-key:
@@ -36,9 +40,23 @@ runs:
         CLOUDFLARED_SHA256: "9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17"
       run: |
         set -euo pipefail
+
+        # Self-hosted runner images preinstall this exact pinned build
+        # (sha256-verified at image build time, see runner/Dockerfile). Use it
+        # when the version matches: no download, no stall on a slow link. A
+        # missing or different version falls through to the verified download.
+        if command -v cloudflared >/dev/null 2>&1 \
+          && cloudflared --version 2>/dev/null | grep -qF "version ${CLOUDFLARED_VERSION} "; then
+          echo "Using preinstalled cloudflared ${CLOUDFLARED_VERSION}"
+          cloudflared --version
+          exit 0
+        fi
+
         url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
         echo "Fetching pinned cloudflared ${CLOUDFLARED_VERSION}"
-        curl -fsSL --retry 3 --retry-connrefused "$url" -o /tmp/cloudflared
+        # --max-time bounds each attempt: a stalled transfer used to hold a
+        # deploy job for 8-13 minutes before failing.
+        curl -fsSL --retry 3 --retry-connrefused --max-time 60 "$url" -o /tmp/cloudflared
 
         # Verify BEFORE install. A mismatch means the pinned asset changed
         # underneath us — refuse rather than run an unknown binary as the

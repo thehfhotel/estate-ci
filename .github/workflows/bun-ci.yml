@@ -19,10 +19,15 @@ on:
         type: string
         default: "."
       bun-version:
-        description: "Bun version for oven-sh/setup-bun."
+        description: >-
+          Bun version for oven-sh/setup-bun. Keep it an EXACT version: with a
+          range ("1.3") setup-bun resolves it over the network and cannot
+          recognise a Bun already on the runner, while an exact match against
+          the runner's own install is used as is with no download at all.
+          Callers may override it.
         required: false
         type: string
-        default: "1.3"
+        default: "1.3.14"
       run_build:
         description: >-
           Run the `build` script when the package declares one. Turn off for a
@@ -69,6 +74,11 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ inputs.bun-version }}
+          # No Actions-cache round trip for the Bun binary: a self-hosted
+          # runner that already has this exact version is used as is, and a
+          # GitHub-hosted runner downloads the release directly. The cache
+          # service was the slow path (36 MB at ~1 MB/s, multi-minute stalls).
+          no-cache: true
 
       # --frozen-lockfile, never a plain install: a lockfile that does not
       # match package.json must fail CI here, not resolve to something the
