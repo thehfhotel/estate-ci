@@ -22,6 +22,15 @@
 #     regardless, so this is belt-and-braces, not load-bearing.
 #   - `TZ` is pinned to a fixed zone instead of left at the `${TZ:-UTC}`
 #     default below.
+#   - the box wires the job-completed hook and the shared cache root into every
+#     runner (see the commented block under `environment:`/`volumes:` below and
+#     README.md "Cache pruning"), and sets HF_CI_PRUNE_IMAGE to its own runner
+#     image tag so the prune container matches the runner build.
+#   - sizing differs per runner, which a one-service template cannot express:
+#     the box runs two "heavy" runners (3 GiB, 2 CPUs) and one "light" runner
+#     (1.5 GiB, 2 CPUs; at 1 CPU it ran 15-50% slower than the others and still
+#     took about a third of the light jobs). CPU is not the saturated resource,
+#     disk I/O is, so a light runner gets the full 2 CPUs and only less memory.
 #   - the box runs this as MULTIPLE services (one per runner, e.g.
 #     `runner-1`/`runner-2`) under one compose project, each with its own
 #     `state-N`/`work-N` host directories and RUNNER_NAME — this file
@@ -41,6 +50,12 @@ services:
       RUNNER_WORKDIR: ${RUNNER_WORKDIR:?set the absolute work dir path — identical on host and container}
       RUNNER_TOOL_CACHE: /opt/hostedtoolcache
       TZ: ${TZ:-UTC}
+      # Optional: wire the job-completed hook (workspace wipe, credential sweep,
+      # size-gated cache prune — see README.md). Mount the hooks dir read-only
+      # at the path named here, and give every runner the same cache root.
+      # ACTIONS_RUNNER_HOOK_JOB_COMPLETED: /runner-hooks/job-completed.sh
+      # HF_CI_CACHE: ${HF_CI_CACHE}
+      # HF_CI_PRUNE_IMAGE: hf-runner:<tag>   # defaults to this container's own image
     volumes:
       # Persistent runner identity + self-update state — see README.md.
       - ${RUNNER_STATE_DIR:?set the host path for this runner's state dir}:/runner
@@ -52,6 +67,9 @@ services:
       # start time by entrypoint.sh (it maps the socket's own GID into the
       # runner user's supplementary groups), not by anything declared here.
       - /var/run/docker.sock:/var/run/docker.sock
+      # Optional, with the env block above:
+      # - ./hooks:/runner-hooks:ro
+      # - ${HF_CI_CACHE}:${HF_CI_CACHE}   # identical path on both sides (DooD)
     mem_limit: 4g
     cpus: "2.0"
     logging:
