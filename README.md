@@ -241,6 +241,7 @@ in the diff.
 | `image` | no | `""` | LEGACY. Full image ref, e.g. `ghcr.io/thehfhotel/housekeeping`. Also names the `:buildcache` tag. Mutually exclusive with `image_name`. |
 | `image_name` | no | `""` | Bare app segment, e.g. `hf-analytics` — no registry prefix. Mutually exclusive with `image`. The registry is resolved at build time (see "Image registry selection" above) and written to the deploy `.env` as `IMAGE_REGISTRY`. |
 | `runner_labels` | no | `""` | JSON array, e.g. `'["self-hosted","<box-label>"]'`. Applied to both jobs via `fromJSON` when non-empty; empty keeps both on `ubuntu-latest`. |
+| `build_runner_labels` | no | `""` | JSON array like `runner_labels`, for the **build** job only (for example with `heavy`, so image builds take the heavy lane while deploy stays on the express lane). Empty means the build job uses `runner_labels`. |
 | `build_timeout_minutes` | no | `30` | `timeout-minutes` on the build job. |
 | `deploy_timeout_minutes` | no | `15` | `timeout-minutes` on the deploy job. |
 | `host_port` | yes | — | Written to the container `.env` as `HOST_PORT`. A string, so quote it. |

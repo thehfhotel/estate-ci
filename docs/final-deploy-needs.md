@@ -113,7 +113,15 @@ jobs:
   # Pull request only: the last job of a green run vouches for the tree.
   record:
     needs: [route, web, backend]
-    if: github.event_name == 'pull_request' && !failure() && !cancelled()
+    # always(): this `if` has no status function of its own (contains() is not
+    # one), so without it GitHub's implicit success() would skip the job whenever
+    # any suite was skipped. Record only when a suite really ran green; never
+    # when everything was skipped (docs only) or anything failed.
+    if: >-
+      always() && github.event_name == 'pull_request' &&
+      needs.route.outputs.docs_only != 'true' &&
+      (needs.web.result == 'success' || needs.backend.result == 'success') &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: [self-hosted, <site>]
     timeout-minutes: 5
     steps:
@@ -129,7 +137,7 @@ jobs:
     needs: [route, tree, web, backend]
     if: >-
       github.event_name == 'push' &&
-      always() && !failure() && !cancelled() &&
+      !failure() && !cancelled() &&
       needs.route.outputs.docs_only != 'true'
     uses: thehfhotel/estate-ci/.github/workflows/deploy-evergreen.yml@<sha>
     permissions:
@@ -139,7 +147,8 @@ jobs:
       app_name: <app>
       image_name: <app>
       host_port: "<port>"
-      runner_labels: '["self-hosted","<site>"]'
+      runner_labels: '["self-hosted","<site>"]'                  # deploy: express lane
+      build_runner_labels: '["self-hosted","<site>","heavy"]'    # image build: heavy lane
     secrets:
       ssh_key: ${{ secrets.<APP>_DEPLOY_SSH_KEY }}
       host_key: ${{ secrets.EVERGREEN_HOST_KEY }}
@@ -164,8 +173,8 @@ or the run was cancelled. A job's `needs.<id>.result` is `success`, `failure`,
 
 - `!failure() && !cancelled()` is true when no job in the chain failed and the
   run was not cancelled; `success` and `skipped` both pass. That is the
-  condition used above, with `always()` in front so the job is evaluated even
-  when a need was skipped.
+  condition used above. Both are status functions, so they also switch off the
+  implicit `success()`; no `always()` is needed with them.
 - Without a status function in the `if:`, GitHub adds an implicit `success()`,
   and a skipped need then skips the job. Without `!failure()` but with `always()`
   alone, a failed test job lets the deploy through. That has reached production
@@ -185,6 +194,12 @@ Two more rules for the `deploy` job:
 - `deploy-evergreen.yml` does not run tests and refuses a `pull_request` caller.
   The `needs:` and the `push` gate above are what keep a red or unreviewed tree
   off production.
+
+A suite name with a `-` in it needs bracket access: `fromJSON(...)['web-app']`,
+not `.web-app`.
+
+A docs-only push skips the deploy, and a previous deploy that failed or was
+dropped is not retried by it; re-run it with `force_deploy` (see the README).
 
 Add `workflow_dispatch` to the deploy job's event check if the pipeline also
 runs from the Actions tab (a forced re-roll uses `force_deploy`, see the README).

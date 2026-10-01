@@ -51,10 +51,17 @@ Notes:
 pending run. When a third run arrives, the older *pending* run is cancelled and
 replaced, whatever `cancel-in-progress` says. On `main`, three quick merges give:
 the first runs, the second is dropped, the third runs after the first. That is
-usually right for deploys (the last one wins and carries the earlier changes),
-but the dropped run's checks never happen. If every commit on `main` must get
-its own full pipeline, put the commit in the group so nothing queues behind
-anything, and let the deploy job's own group serialize the deploys:
+right for a deploy when the pipeline tests the whole tree (the last one wins and
+carries the earlier changes), but the dropped run's checks never happen. It is
+**not** safe once the pipeline narrows work by what a push changed: `route`
+diffs `github.event.before..sha`, so if push B is dropped while pending and push
+C touches a different suite, B's suite is never tested on `main`; if C is
+docs-only, B's code is neither tested nor deployed. ADR 0002 decision 6 (one
+merge per repository at a time, the next waits for the previous main pipeline)
+makes this rare but does not make it impossible. A pipeline that uses `route` or a
+docs-only deploy skip should therefore put the commit in the group, so no push
+ever queues behind another, and let the deploy job's own group serialize the
+deploys:
 
 ```yaml
 concurrency:
