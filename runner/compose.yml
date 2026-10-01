@@ -60,6 +60,10 @@ services:
       RUNNER_WORKDIR: ${RUNNER_WORKDIR:?set the absolute work dir path — identical on host and container}
       RUNNER_TOOL_CACHE: /opt/hostedtoolcache
       TZ: ${TZ:-UTC}
+      # Marker the job hooks require (together with /.dockerenv) before they wipe
+      # the workspace or sweep $HOME credentials, so they refuse to run on a
+      # workstation. Transitional here: the image sets it too once it is rebuilt.
+      HF_CI_RUNNER_CONTAINER: "1"
       # Optional: wire the job hooks (job rows, workspace wipe, credential sweep,
       # size-gated cache prune — see README.md). Mount the WHOLE hooks dir
       # read-only at the path named here (the hooks source job-row.sh from their

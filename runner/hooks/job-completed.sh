@@ -33,7 +33,12 @@
 # path — see runner/README.md. The script can also be `source`d (its main flow
 # is guarded), which is how the prune functions are tested.
 #
-# Must NEVER fail the job: always exit 0, regardless of what happens above.
+# NEVER execute this script on a workstation or the host shell (its credential
+# sweep deletes ~/.ssh): it refuses with exit 2 unless HF_CI_RUNNER_CONTAINER=1
+# and /.dockerenv exist. Test it only inside a throwaway container.
+#
+# Inside the runner container it must NEVER fail the job: always exit 0,
+# regardless of what happens above.
 
 # ---------------------------------------------------------------------------
 # Cache prune (functions only; nothing runs until hf_prune_launch is called)
@@ -580,8 +585,8 @@ hf_prune_markers() {
   return 0
 }
 
-# The whole prune. Runs as root in the detached container (or inline as a
-# fallback). Single instance via a lock file in the cache root.
+# The whole prune. Runs as root in the detached container only. Single
+# instance via a lock file in the cache root.
 hf_prune_main() {
   local r lvl cutoff before after any=0 daily=0 freed_kb=0
   [ -n "${HF_CI_CACHE:-}" ] && [ -d "$HF_CI_CACHE" ] || return 0
@@ -637,7 +642,7 @@ hf_prune_main() {
 # inside a `container:` leaves a root-owned target dir that this unprivileged
 # hook cannot touch) and never delays the job that just finished. The fixed
 # container name makes it single-instance; a hard timeout bounds the lock it
-# holds. Falls back to an inline best-effort prune when docker is unavailable.
+# holds. Without docker or the image the prune is skipped, never run inline.
 hf_prune_launch() {
   local image v envargs=() cgp=() script fns
   hf_prune_gate || return 0
@@ -674,8 +679,9 @@ hf_prune_main >> \"\$HF_CI_CACHE/prune.log\" 2>&1"
       echo "job-completed hook: cache prune already running (or docker refused); skipped"
     fi
   else
-    echo "job-completed hook: no prune image available; pruning inline as $(id -un)"
-    hf_prune_main >> "$HF_CI_CACHE/prune.log" 2>&1 || true
+    # Never prune inline: the prune deletes by path, and it must only ever run
+    # in the root sibling container (see "Cache pruning" in runner/README.md).
+    echo "job-completed hook: docker or the prune image is unavailable; prune skipped"
   fi
   return 0
 }
@@ -684,6 +690,15 @@ hf_prune_main >> \"\$HF_CI_CACHE/prune.log\" 2>&1"
 # Main flow. Guarded so `source job-completed.sh` only defines the functions.
 # ---------------------------------------------------------------------------
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  # GUARD, before anything else. The wipe and the credential sweep below delete
+  # $HOME/.ssh, $HOME/.config/gh and more: on a workstation that is the owner's
+  # keys. Run only inside the CI runner container, which carries the marker
+  # (HF_CI_RUNNER_CONTAINER=1, set by the image and the compose file) and
+  # Docker's /.dockerenv. Anywhere else: no row, no wipe, no sweep, no prune.
+  if [ "${HF_CI_RUNNER_CONTAINER:-}" != "1" ] || [ ! -e /.dockerenv ]; then
+    echo "job-completed hook: refusing to run outside the CI runner container (HF_CI_RUNNER_CONTAINER/.dockerenv missing)" >&2
+    exit 2
+  fi
   set -u
   set +e   # the runner may invoke hooks with `bash -e`; this hook must never fail the job
 

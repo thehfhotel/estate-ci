@@ -9,7 +9,14 @@
 # The hooks directory must be mounted whole, because this script sources
 # job-row.sh from its own directory.
 #
-# Must NEVER fail or delay the job: no network, no `set -e`, always exit 0.
+# Inside the runner container it must NEVER fail or delay the job: no network,
+# no `set -e`, always exit 0. Never execute it on a workstation or the host shell.
+
+# Same guard as job-completed.sh: only inside the CI runner container.
+if [ "${HF_CI_RUNNER_CONTAINER:-}" != "1" ] || [ ! -e /.dockerenv ]; then
+  echo "job-started hook: refusing to run outside the CI runner container (HF_CI_RUNNER_CONTAINER/.dockerenv missing)" >&2
+  exit 2
+fi
 
 set +e
 _hf_hooks_dir="${HF_CI_HOOKS_DIR:-$(dirname -- "${BASH_SOURCE[0]:-$0}")}"

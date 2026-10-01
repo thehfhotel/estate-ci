@@ -172,6 +172,18 @@ job.
 
 ## Workspace hygiene: the job-completed hook
 
+**Never execute runner/hooks or runner/ops scripts on a workstation or the host shell.** The
+credential sweep deletes `~/.ssh`, `~/.config/gh` and other credentials of whoever runs it (it
+has already deleted a workstation's SSH keys once). Test them only inside a throwaway
+`docker run --rm` container, or reason about them.
+
+As a backstop both hooks refuse to run unless `HF_CI_RUNNER_CONTAINER=1` is set AND `/.dockerenv`
+exists: otherwise they print one line to stderr and exit 2 before writing a row, wiping, sweeping
+or pruning. The image and the compose file set the marker for the runner containers. A runner
+that lacks the marker would make every job fail on the hook, so add the marker to the runner
+environment (and recreate the runners) BEFORE installing a guarded hook. `ops/test-guard.sh`
+proves the refusal and the normal path inside a container.
+
 Because runners are persistent (see above), the same `work-N` directory is
 reused, unwiped, across every job that lands on it. A job that does a sparse
 or otherwise narrowed checkout leaves that narrowed tree sitting there for
@@ -426,8 +438,8 @@ also hosts production, CI data on it is pruned before production runs short:
   a job that builds inside a `container:` leaves a root-owned target dir that the
   runner user cannot delete. The container image is `HF_CI_PRUNE_IMAGE`, or by
   default the image the runner itself runs (it needs bash, GNU find/awk, flock
-  and the Docker CLI). Without a usable image it falls back to an inline
-  best-effort prune as the runner user. `HF_CI_CGROUP_PARENT`, when set, is
+  and the Docker CLI). Without docker or a usable image the prune is
+  skipped with a log line: it is never run inline in the hook. `HF_CI_CGROUP_PARENT`, when set, is
   passed as `--cgroup-parent` to the prune and wipe containers so they join the
   CI cgroup slice too.
 - It appends one block per run to `$HF_CI_CACHE/prune.log` (free space before
@@ -456,7 +468,7 @@ docker run --rm --user 0:0 --entrypoint bash \
 Do not run the whole hook on the host to test it: its credential sweep deletes
 the `$HOME` locations listed above.
 
-`ops/test-prune.sh` is the regression test for the rules above: it builds a fake
+`ops/test-prune.sh` (and `ops/test-guard.sh`, for the hook guard) are regression tests; both refuse to run outside a container. The prune test checks the rules above: it builds a fake
 cargo target dir under `/tmp`, runs the prune on it and checks which variants
 survive (own keep-K, third-party atime, build-script stems, the `noatime`
 fallback and the freed-space counter). It needs GNU `find`, so run it on Linux,

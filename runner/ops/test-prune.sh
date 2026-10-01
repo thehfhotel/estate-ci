@@ -7,6 +7,8 @@
 #   docker run --rm --entrypoint bash -v "$PWD/runner:/r:ro" <runner-image> /r/ops/test-prune.sh
 # Exits non-zero when a check fails.
 set -u
+# Refuse outside a container: never run runner scripts on a workstation or the host shell.
+[ -e /.dockerenv ] || { echo "test-prune: refusing to run outside a container (/.dockerenv missing)" >&2; exit 2; }
 source "${HOOK:-$(dirname "${BASH_SOURCE[0]}")/../hooks/job-completed.sh}"
 T=$(mktemp -d /tmp/prunetest.XXXXXX)
 P=$T/repo/target-ci/debug
