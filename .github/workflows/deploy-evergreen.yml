@@ -55,6 +55,16 @@ on:
         required: false
         type: string
         default: ""
+      build_runner_labels:
+        description: >-
+          JSON array of runner labels for the BUILD job only, e.g.
+          '["self-hosted","<box-label>","heavy"]', so an image build can use
+          the heavy lane while deploy stays on the express lane. Empty (the
+          default) means the build job uses `runner_labels`, exactly as before,
+          so every existing caller is unaffected.
+        required: false
+        type: string
+        default: ""
       build_timeout_minutes:
         description: "timeout-minutes for the build job."
         required: false
@@ -161,7 +171,8 @@ jobs:
     # Skipped, not failed, on force_deploy — the deploy gate below is written
     # to read that as permission to re-roll :latest.
     if: ${{ !inputs.force_deploy }}
-    runs-on: ${{ inputs.runner_labels != '' && fromJSON(inputs.runner_labels) || 'ubuntu-latest' }}
+    # build_runner_labels wins when set; otherwise the build follows runner_labels.
+    runs-on: ${{ inputs.build_runner_labels != '' && fromJSON(inputs.build_runner_labels) || (inputs.runner_labels != '' && fromJSON(inputs.runner_labels) || 'ubuntu-latest') }}
     timeout-minutes: ${{ inputs.build_timeout_minutes }}
     permissions:
       contents: read
