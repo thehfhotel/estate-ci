@@ -1,0 +1,24 @@
+# Toolchains baked into the runner image (see seed-toolchains.sh and README.md).
+# One per line: <tool> <version> <sha256> <url>. Exact versions, sha256-verified
+# at build time, linux/x64 only. `tool` is bun, node or python.
+#
+# The versions are the ones the estate's workflows pin today:
+#   bun    1.3.14  estate-ci bun-ci default and most Bun repositories
+#          1.4.2   one repository holds back on this
+#   node   20, 22, 24, 26   setup-node `node-version` majors in use. Node 20 is
+#          end-of-life; drop it from this file once nothing pins it.
+#   python 3.11, 3.13   setup-python `python-version` in use
+# setup-node and setup-python accept any cached version that satisfies the
+# requested range, so each major here serves every pin of that major.
+#
+# To bump: edit the line (version, url and sha256 together; the hash comes from
+# the upstream checksum file or release asset digest), rebuild the image. To
+# add a pin the estate starts using: add a line. To shrink the image: delete one.
+bun    1.3.14  951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f  https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64.zip
+bun    1.4.2   36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913  https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip
+node   20.20.2 19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b  https://nodejs.org/dist/v20.20.2/node-v20.20.2-linux-x64.tar.gz
+node   22.23.3 1084aa36196bba4c3a5e69a1ee388a6e4ff729dad09445fbcd434b28fe3c24af  https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.gz
+node   24.21.0 6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff  https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.gz
+node   26.10.0 cb5c9ce9c80d7b8821e3a258543c71b939138cf17c74d5cc44bbe85d6dbc5ad8  https://nodejs.org/dist/v26.10.0/node-v26.10.0-linux-x64.tar.gz
+python 3.11.17 ae713815fe406a06f1691856f697a0b1e58b3e986f44e62f0cd0bca2424f1aac  https://github.com/actions/python-versions/releases/download/3.11.17-36876195594/python-3.11.17-linux-24.04-x64.tar.gz
+python 3.13.16 d6f5f504043400592e9dcf368ba262c64d998608646cc22281b5a75beecbc872  https://github.com/actions/python-versions/releases/download/3.13.16-36805956071/python-3.13.16-linux-24.04-x64.tar.gz

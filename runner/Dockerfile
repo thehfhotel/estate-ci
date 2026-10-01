@@ -78,6 +78,48 @@ RUN set -eux; \
     cloudflared --version; \
     trivy --version
 
+# Preinstalled toolchains, so setup-bun / setup-node / setup-python stop
+# downloading them per job. Which versions: toolchains.txt (exact versions and
+# sha256, one per line); how each action finds them: README.md "Preinstalled
+# toolchains". Two different mechanisms:
+#   - node and python are laid out the way actions/toolkit's tool cache expects
+#     (<Tool>/<version>/x64 + x64.complete). Compose bind-mounts a host directory
+#     over RUNNER_TOOL_CACHE (/opt/hostedtoolcache), which would HIDE anything
+#     baked there, so the build output is moved to a seed directory and
+#     entrypoint.sh copies the missing <tool>/<version> dirs into the mount at
+#     start (hf-seed-toolcache). It is built at the path the mount normally has
+#     because Python's pip scripts carry absolute shebangs.
+#   - bun is not a tool-cache tool: setup-bun reuses ONE binary at
+#     ~/.bun/bin/bun when `bun --revision` equals the requested version. Each
+#     version lives under HF_TOOLCHAIN_DIR (not hidden by any mount), and the
+#     estate default is COPIED to ~/.bun/bin/bun (never symlinked: when
+#     setup-bun's rename fails with EXDEV it falls back to copyFileSync, which
+#     writes THROUGH a symlink and would overwrite the baked copy), so a fresh
+#     container needs no download for it. bun-ci.yml copies the exact version it
+#     asks for.
+ARG TOOLCACHE_BAKED_PATH=/opt/hostedtoolcache
+ARG DEFAULT_BUN_VERSION=1.3.14
+# HF_CI_RUNNER_CONTAINER marks this as the CI runner image. Hooks that delete
+# things (the job-completed credential sweep) refuse to run unless it is set and
+# /.dockerenv exists, so they can never run against a workstation's real HOME.
+ENV HF_CI_RUNNER_CONTAINER=1
+ENV HF_TOOLCHAIN_DIR=/opt/hf-toolchains \
+    HF_TOOLCACHE_SEED=/opt/toolcache-seed \
+    HF_TOOLCACHE_BAKED_PATH=${TOOLCACHE_BAKED_PATH}
+COPY toolchains.txt seed-toolchains.sh /opt/hf-build/
+RUN set -eux; \
+    chmod +x /opt/hf-build/seed-toolchains.sh; \
+    TOOLCACHE_ROOT="${TOOLCACHE_BAKED_PATH}" /opt/hf-build/seed-toolchains.sh /opt/hf-build/toolchains.txt; \
+    mkdir -p "${TOOLCACHE_BAKED_PATH}"; \
+    mv "${TOOLCACHE_BAKED_PATH}" "${HF_TOOLCACHE_SEED}"; \
+    mkdir -p "${TOOLCACHE_BAKED_PATH}"; \
+    test -x "${HF_TOOLCHAIN_DIR}/bun/${DEFAULT_BUN_VERSION}/bun"; \
+    mkdir -p /home/runner/.bun/bin; \
+    install -m 0755 "${HF_TOOLCHAIN_DIR}/bun/${DEFAULT_BUN_VERSION}/bun" /home/runner/.bun/bin/bun; \
+    ln -s bun /home/runner/.bun/bin/bunx; \
+    chown -R runner:runner "${HF_TOOLCACHE_SEED}" "${HF_TOOLCHAIN_DIR}" /home/runner/.bun; \
+    rm -rf /opt/hf-build
+
 # Same trust model as a GitHub-hosted runner: the job user can sudo freely
 # inside its own container, via the base image's own `%sudo` rule (it does
 # `echo "%sudo ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers`, which TRUNCATES
@@ -90,8 +132,9 @@ RUN set -eux; \
 # group into `runner`'s supplementary groups at start time) is the real
 # privilege boundary.
 
+COPY seed-toolcache.sh /usr/local/bin/hf-seed-toolcache
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh /usr/local/bin/hf-seed-toolcache
 
 # Stays root: the entrypoint fixes up ownership of bind-mounted volumes
 # (which land root-owned from the host) before gosu-ing down to `runner`.
