@@ -9,7 +9,17 @@
 # — nothing org-specific is baked in here. See README.md for the full list.
 set -euo pipefail
 
-RUNNER_HOME="/runner"
+# Identical absolute path inside and outside this container (like
+# RUNNER_WORKDIR below) — required so that when this runner process
+# talks to the HOST docker daemon over the mounted socket and asks it to
+# bind-mount its own externals dir (RUNNER_HOME/externals) into a job
+# container at /__e for container actions / `uses: docker://` steps, the
+# path the daemon is given actually exists on the host filesystem. A
+# RUNNER_HOME that differs from its host-side bind source (e.g. the
+# previous "/runner") resolves to nothing on the host and every such
+# mount silently comes up empty (exec failures like "stat
+# /__e/node24/bin/node: no such file or directory").
+RUNNER_HOME="${RUNNER_HOME:-/runner}"
 # Where the base image ships its runner install (config.sh, run.sh, bin/, …).
 BASE_RUNNER_INSTALL="/home/runner"
 

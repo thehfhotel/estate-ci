@@ -15,6 +15,12 @@ USER root
 # Ubuntu package. gosu drops back to the unprivileged runner user in the
 # entrypoint without the signal-handling problems `su`/`sudo` have as PID 1's
 # child.
+# build-essential/pkg-config/libssl-dev/libpq-dev: GitHub-hosted
+# ubuntu-latest ships these by default; this custom image does not, and
+# lint/test jobs that run bare (no `container:`) need `cc` to compile any
+# crate at all (openssl-sys/libpq-sys need the -dev headers too) -- missing
+# them fails every cargo fmt/clippy/test job the moment a repo migrates off
+# ubuntu-latest.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -26,6 +32,10 @@ RUN apt-get update \
         zip \
         sudo \
         gosu \
+        build-essential \
+        pkg-config \
+        libssl-dev \
+        libpq-dev \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
         | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
