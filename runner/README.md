@@ -40,6 +40,69 @@ To bump either one, change the `ARG` pair in the `Dockerfile`, and for
 `cloudflared` the matching pin in the action, then rebuild and recreate the
 runners (an image rebuild never touches a running container).
 
+### Preinstalled toolchains
+
+So `oven-sh/setup-bun`, `actions/setup-node` and `actions/setup-python` stop
+downloading per job, the image also carries the toolchain versions the estate's
+workflows pin. The list is `toolchains.txt` (exact version, sha256 and URL per
+line, linux/x64 only); `seed-toolchains.sh` installs it at build time and fails
+the build on a checksum mismatch or a binary that reports the wrong version.
+`SEED_DRY_RUN=1 bash seed-toolchains.sh toolchains.txt` downloads and checks
+every checksum without installing anything.
+
+Where each action looks, read from the action sources, and so where the image
+keeps each tool:
+
+| Action | Looks for | Image keeps it at |
+|---|---|---|
+| `setup-node` | the tool cache: `$RUNNER_TOOL_CACHE/node/<version>/x64` with a sibling `x64.complete` marker. Any cached version that satisfies the requested range is used (`22` finds `22.x.y`) unless `check-latest` is set. | seed dir, copied at start (below) |
+| `setup-python` | the tool cache: `$RUNNER_TOOL_CACHE/Python/<version>/x64` plus `x64.complete`, matched the same way (`3.13` finds `3.13.x`). | seed dir, copied at start |
+| `setup-bun` | **not** the tool cache. One binary at `~/.bun/bin/bun`, reused only when `bun --revision` equals the requested version exactly (a range like `1.3` never matches); otherwise it downloads and overwrites that file. | `$HF_TOOLCHAIN_DIR/bun/<version>/bun`; the estate default is linked at `~/.bun/bin/bun` |
+
+**The bind-mount caveat.** `compose.yml` mounts a host directory over
+`RUNNER_TOOL_CACHE`, so anything baked into the image at that path is hidden at
+run time. The image therefore keeps node and python in a seed directory
+(`/opt/toolcache-seed`, built at the path the mount normally has, because
+Python's pip scripts carry absolute shebangs), and `entrypoint.sh` runs
+`hf-seed-toolcache` at start: it copies each `<tool>/<version>/<arch>` the mount
+does not already hold, never overwrites one, writes the `.complete` marker last,
+and takes a lock in the cache so runners that start together do not fight over
+the shared directory. A failure is logged and the runner starts anyway, with
+`setup-*` downloading as before. Python is seeded only when `RUNNER_TOOL_CACHE`
+is the path the image was built for.
+
+Bun cannot work that way (one slot, exact match), so `bun-ci.yml` links the
+image's copy of the exact version it was asked for into `~/.bun/bin/bun` before
+`setup-bun` runs; `setup-bun` then reports "Using existing Bun installation".
+A job that calls `setup-bun` itself gets the estate default for free and can do
+the same for another version:
+
+```yaml
+      - run: |
+          src="${HF_TOOLCHAIN_DIR:-/opt/hf-toolchains}/bun/1.4.2/bun"
+          [ -x "$src" ] && mkdir -p ~/.bun/bin && ln -sfn "$src" ~/.bun/bin/bun || true
+      - uses: oven-sh/setup-bun@<sha>
+        with:
+          bun-version: 1.4.2
+          no-cache: true
+```
+
+Not baked: Rust toolchains (`dtolnay/rust-toolchain` drives `rustup`, which keeps
+toolchains in the runner user's home, already persistent per runner container)
+and `pnpm`.
+
+Host notes for a rollout (do it while the runners are idle):
+
+- The image grows by roughly 1.7 GB, and the shared tool cache by roughly 1.5 GB
+  the first time a runner starts (estimates from the archive sizes; check `du`
+  after the first build). Delete lines from `toolchains.txt` to trim.
+- Build with the usual `docker build`; recreate the runners afterwards (an image
+  rebuild never touches a running container). Only the first runner to start
+  copies; the others find the markers and skip.
+- Nothing else changes: `compose.yml` and the hooks are untouched.
+- A seeded cache does not make `setup-node` upgrade: it keeps using the
+  cached patch version. Rebuild the image with newer lines to move it.
+
 ## Run
 
 `compose.yml` in this directory is a generic template for one instance —

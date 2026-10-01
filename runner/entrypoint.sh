@@ -41,6 +41,16 @@ if [ -n "${RUNNER_TOOL_CACHE:-}" ]; then
   export RUNNER_TOOL_CACHE
   mkdir -p "${RUNNER_TOOL_CACHE}"
   chown -R runner:runner "${RUNNER_TOOL_CACHE}"
+
+  # The bind mount over RUNNER_TOOL_CACHE hides anything the image keeps at that
+  # path, so the toolchains baked into the image live in a seed directory and
+  # are copied in here: only the <tool>/<version> dirs the cache lacks, never
+  # overwriting, safe with several runners starting at once. Best effort: a
+  # failure leaves setup-* to download as before. See seed-toolcache.sh.
+  if command -v hf-seed-toolcache >/dev/null 2>&1; then
+    hf-seed-toolcache "${HF_TOOLCACHE_SEED:-/opt/toolcache-seed}" "${RUNNER_TOOL_CACHE}" ||
+      echo "entrypoint: tool cache seeding failed; continuing" >&2
+  fi
 fi
 
 # The job work dir (passed to config.sh --work below) is bind-mounted from
