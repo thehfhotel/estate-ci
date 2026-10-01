@@ -237,6 +237,29 @@ non-zero, and "no tests yet" must not masquerade as a red suite. A skipped step
 still leaves the job green: this workflow trusts your `package.json` to declare
 what you want checked.
 
+### Job containers and the CI cgroup slice
+
+The runners share a host with production, so CI containers belong in one cgroup
+slice with a low CPU weight, a memory ceiling and an I/O cap. The estate value
+is `hf-ci.slice`; a container joins it only when asked with
+`--cgroup-parent=hf-ci.slice`. Neither reusable workflow here starts a job
+`container:` or `services:`, so there is nothing to pass them; a caller that
+defines its own adds the option (here via an org Actions variable that renders to
+nothing when unset):
+
+```yaml
+    container:
+      image: ghcr.io/<owner>/ci-image:1
+      options: ${{ vars.HF_CI_CGROUP_PARENT && format('--cgroup-parent={0}', vars.HF_CI_CGROUP_PARENT) || '' }}
+    services:
+      db:
+        image: postgres:17
+        options: --cgroup-parent=hf-ci.slice --health-cmd pg_isready
+```
+
+Every way a job starts a container, and why the BuildKit builder is a host
+setting rather than an input, is in `docs/cgroup-parent.md`.
+
 ## Change policy
 
 A commit here can change what runs on every estate repo's path to production.
