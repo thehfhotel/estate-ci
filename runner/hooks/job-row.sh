@@ -28,9 +28,21 @@
 # The helper must never fail or slow a job: it makes no network calls, takes
 # the lock for at most 2 s, and swallows every error.
 
+# True when $1 has any byte outside printable ASCII (checked in the C locale).
+hf_job_nonascii() {
+  local LC_ALL=C
+  case $1 in *[!' '-~]*) return 0;; esac
+  return 1
+}
+
 hf_job_json_str() {
   local s=$1
   if [ -z "$s" ]; then printf 'null'; return 0; fi
+  # Invalid UTF-8 would make the whole line invalid JSON: drop such bytes.
+  if hf_job_nonascii "$s" && command -v iconv >/dev/null 2>&1; then
+    s=$(printf '%s' "$s" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null)
+    if [ -z "$s" ]; then printf 'null'; return 0; fi
+  fi
   s=${s//\\/\\\\}
   s=${s//\"/\\\"}
   s=${s//[$'\001'-$'\037']/ }

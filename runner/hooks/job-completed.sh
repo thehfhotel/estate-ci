@@ -123,6 +123,46 @@ function parse(name, mode,    p, i, rest, d, h, ext) {
 AWKEOF
 }
 
+# Symlink containment. The cache is writable by every job, so a job can plant a
+# symlink where the prune expects a directory (<repo>/target-x -> /elsewhere, a
+# profile dir, a junk dir). The prune runs as root and must never delete through
+# one. Rules: never follow a link (find -P everywhere, never -L), skip any root,
+# profile, scratch dir or candidate that IS a link, and have hf_prune_apply (the
+# one delete choke point) prove that the directory it deletes in resolves to a
+# place under the real path of the root being pruned.
+#
+# True when the real path of $1 is strictly under the real path of $2.
+hf_prune_within() {
+  local p b
+  # -m: components that do not exist yet (a marker dir about to be created) are fine.
+  p=$(readlink -m -- "$1" 2>/dev/null || readlink -f -- "$1" 2>/dev/null) || return 1
+  b=$(readlink -m -- "$2" 2>/dev/null || readlink -f -- "$2" 2>/dev/null) || return 1
+  [ -n "$p" ] && [ -n "$b" ] || return 1
+  case "$p" in "$b"/*) return 0;; esac
+  return 1
+}
+
+# True when $1 may be pruned as a cargo target root: a real directory (not a
+# link), whose repo directory is not a link either, and (when HF_CI_CACHE is
+# set) which resolves to somewhere under the cache root.
+hf_prune_root_ok() {
+  local r=$1
+  [ -d "$r" ] && [ ! -L "$r" ] || return 1
+  [ ! -L "$(dirname -- "$r")" ] || return 1
+  if [ -n "${HF_CI_CACHE:-}" ]; then hf_prune_within "$r" "$HF_CI_CACHE" || return 1; fi
+  return 0
+}
+
+# True unless a prune was launched less than HF_CI_PRUNE_RELAUNCH_MIN (10)
+# minutes ago. Under an emergency (low free space) every job end would otherwise
+# start another full sweep.
+hf_prune_relaunch_ok() {
+  local stamp="${HF_CI_CACHE:-}/.launch-stamp"
+  [ "${PRUNE_DRY_RUN:-0}" = "1" ] && return 0
+  [ -f "$stamp" ] || return 0
+  [ -z "$(find -P "$stamp" -mmin -"${HF_CI_PRUNE_RELAUNCH_MIN:-10}" 2>/dev/null)" ]
+}
+
 # Echo the prune level (0..3) for the filesystem holding $1, or nothing when
 # df cannot say. Measured PER ROOT: a cache root may be a bind mount of a
 # different disk than its siblings, and each disk has its own headroom.
@@ -142,7 +182,7 @@ hf_prune_level() {
 hf_prune_daily_due() {
   local stamp="${HF_CI_CACHE:-}/.prune-stamp"
   [ -f "$stamp" ] || return 0
-  [ -n "$(find "$stamp" -mmin -1440 2>/dev/null)" ] && return 1
+  [ -n "$(find -P "$stamp" -mmin -1440 2>/dev/null)" ] && return 1
   return 0
 }
 
@@ -156,7 +196,7 @@ hf_prune_gate() {
   hf_prune_daily_due && return 0
   hf_prune_rootfs_due && return 0
   for r in "$HF_CI_CACHE"/*/target*; do
-    [ -d "$r" ] || continue
+    hf_prune_root_ok "$r" || continue
     lvl=$(hf_prune_level "$r") || continue
     [ "${lvl:-0}" -ge 1 ] && return 0
   done
@@ -174,8 +214,8 @@ hf_prune_gate() {
 #   $6 scope: own (only stems listed in file $7) | all (default)
 hf_prune_select() {
   local dir=$1 kind=$2 keep=$3 mode=$4 cutoff=$5 scope=${6:-all} ownfile=${7:-}
-  [ -d "$dir" ] || return 0
-  find "$dir" -mindepth 1 -maxdepth 1 -type "$kind" -printf '%T@\t%b\t%f\n' 2>/dev/null |
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+  find -P "$dir" -mindepth 1 -maxdepth 1 -type "$kind" -printf '%T@\t%b\t%f\n' 2>/dev/null |
   awk -F'\t' -v keep="$keep" -v mode="$mode" -v cutoff="$cutoff" -v scope="$scope" -v ownfile="$ownfile" \
     "$(hf_prune_awklib)"'
     BEGIN { if (ownfile != "") while ((getline l < ownfile) > 0) own[l] = 1 }
@@ -215,8 +255,8 @@ hf_prune_select() {
 #   $1 dir  $2 find type (f|d)  $3 atime cutoff  $4 own-stem file  $5 atime index
 hf_prune_select_tp() {
   local dir=$1 kind=$2 tpcutoff=$3 ownfile=$4 hotfile=$5
-  [ -d "$dir" ] || return 0
-  find "$dir" -mindepth 1 -maxdepth 1 -type "$kind" -printf '%T@\t%b\t%f\n' 2>/dev/null |
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+  find -P "$dir" -mindepth 1 -maxdepth 1 -type "$kind" -printf '%T@\t%b\t%f\n' 2>/dev/null |
   awk -F'\t' -v tpc="$tpcutoff" -v ownfile="$ownfile" -v hotfile="$hotfile" \
     "$(hf_prune_awklib)"'
     BEGIN {
@@ -242,7 +282,7 @@ hf_prune_select_tp() {
 hf_prune_own_stems() {
   local prof=$1 exe o
   {
-    find "$prof/deps" -maxdepth 1 -type f -name '*.d' -exec head -qn1 {} + 2>/dev/null |
+    find -P "$prof/deps" -maxdepth 1 -type f -name '*.d' -exec head -qn1 {} + 2>/dev/null |
     awk "$(hf_prune_awklib)"'{
       ci = index($0, ": "); if (ci < 2) next
       tgt = substr($0, 1, ci - 1); src = substr($0, ci + 2)
@@ -267,8 +307,8 @@ hf_prune_own_stems() {
 hf_prune_atime_index() {
   local prof=$1
   {
-    find "$prof/deps" -maxdepth 1 -type f ! -name '*.d' -printf '%A@\t%f\n' 2>/dev/null
-    find "$prof/build" "$prof/.fingerprint" -mindepth 2 -type f -printf '%A@\t%P\n' 2>/dev/null
+    find -P "$prof/deps" -maxdepth 1 -type f ! -name '*.d' -printf '%A@\t%f\n' 2>/dev/null
+    find -P "$prof/build" "$prof/.fingerprint" -mindepth 2 -type f -printf '%A@\t%P\n' 2>/dev/null
   } | awk -F'\t' "$(hf_prune_awklib)"'{
       name = $2; n = index(name, "/"); if (n) name = substr(name, 1, n - 1)
       parse(name, "hex16"); if (!P_ok) next
@@ -297,17 +337,37 @@ hf_prune_atime_ok() {
 # records the freed kilobytes: one number per line appended to the file named by
 # $hf_prune_freed_file (set by hf_prune_main). This runs as the right-hand side
 # of a pipeline, i.e. in a subshell, so a plain variable would be lost.
+# This is the only place that deletes. It refuses unless $dir is a real directory
+# (not a link) that resolves to a place under $hf_prune_base (the real path of
+# the root being pruned, set by hf_prune_root); drops candidates that are links
+# or whose name has a path separator; and deletes by relative name from inside
+# the verified directory, so no path component is resolved a second time.
 #   $1 dir (candidates are relative to it)  $2 size source (blocks|du)  $3 label
 hf_prune_apply() {
-  local dir=$1 sizing=$2 label=$3 cand count kb=0 top
+  local dir=$1 sizing=$2 label=$3 cand safe count kb=0 top here b st n
   cand=$(mktemp) || return 0
   cat > "$cand"
+  if [ -s "$cand" ]; then
+    here=""
+    if [ ! -L "$dir" ] && [ -n "${hf_prune_base:-}" ]; then here=$(cd -P -- "$dir" 2>/dev/null && pwd -P); fi
+    if [ -z "$here" ] || ! hf_prune_within "$here" "$hf_prune_base"; then
+      echo "  refused ${label}: ${dir} is a symlink or resolves outside the prune root, skipped"
+      rm -f "$cand"; return 0
+    fi
+    safe=$(mktemp) || { rm -f "$cand"; return 0; }
+    while IFS=$'\t' read -r b st n; do
+      case "$n" in ''|.|..|*/*) continue;; esac
+      [ -L "$here/$n" ] && continue
+      printf '%s\t%s\t%s\n' "$b" "$st" "$n"
+    done < "$cand" > "$safe"
+    mv -f "$safe" "$cand"
+  fi
   count=$(wc -l < "$cand" | tr -d ' ')
   if [ "$count" -gt 0 ]; then
     if [ "$sizing" = blocks ]; then
       kb=$(awk -F'\t' '{ s += $1 } END { print int(s / 2) }' "$cand")
     else
-      kb=$(cut -f3 "$cand" | tr '\n' '\0' | (cd "$dir" && xargs -0 -r du -sk -- 2>/dev/null) | awk '{ s += $1 } END { print int(s) }')
+      kb=$(cut -f3 "$cand" | tr '\n' '\0' | (cd -P -- "$here" && xargs -0 -r du -sk -- 2>/dev/null) | awk '{ s += $1 } END { print int(s) }')
     fi
     if [ "${PRUNE_DRY_RUN:-0}" = "1" ]; then
       echo "  would remove ${count} ${label}: $((kb / 1024)) MB"
@@ -316,7 +376,10 @@ hf_prune_apply() {
         [ -n "$top" ] && echo "    top stems: ${top}"
       fi
     else
-      cut -f3 "$cand" | tr '\n' '\0' | (cd "$dir" && xargs -0 -r rm -rf -- 2>/dev/null)
+      # Re-verify the directory we actually landed in (a parent may have been
+      # swapped for a link since the check above) before removing anything.
+      cut -f3 "$cand" | tr '\n' '\0' |
+        ( cd -P -- "$here" 2>/dev/null && case "$(pwd -P)" in "$(readlink -f -- "$hf_prune_base")"/*) xargs -0 -r rm -rf -- 2>/dev/null;; esac )
       echo "  removed ${count} ${label}: $((kb / 1024)) MB"
       [ -n "${hf_prune_freed_file:-}" ] && echo "$kb" >> "$hf_prune_freed_file"
     fi
@@ -333,6 +396,8 @@ hf_prune_apply() {
 # profile falls back to keep-K by mtime for every stem, as before.
 hf_prune_root() {
   local r=$1 lvl=$2 cutoff=$3 keep ik tpd tpcut prof exe c pats junk jn jd own hot scope olabel note nown
+  hf_prune_root_ok "$r" || { echo " refused: ${r} is a symlink or outside the cache root, skipped"; return 0; }
+  hf_prune_base=$(readlink -f -- "$r" 2>/dev/null) || return 0
   case "$lvl" in
     1) keep=${HF_CI_PRUNE_K1:-8}; tpd=${HF_CI_PRUNE_TP_DAYS_L1:-3};;
     2) keep=${HF_CI_PRUNE_K2:-2}; tpd=${HF_CI_PRUNE_TP_DAYS_L2:-1};;
@@ -342,7 +407,8 @@ hf_prune_root() {
   tpcut=$(( $(date +%s) - tpd * 86400 )); [ "$tpcut" -gt "$cutoff" ] && tpcut=$cutoff
   for prof in "$r"/*/; do
     prof=${prof%/}
-    [ -d "$prof/deps" ] || continue
+    [ -L "$prof" ] && { echo " profile ${prof#"$r"/}: symlink, skipped"; continue; }
+    [ -d "$prof/deps" ] && [ ! -L "$prof/deps" ] || continue
     own=$(mktemp) || continue; hot=$(mktemp) || { rm -f "$own"; continue; }
     scope=all; olabel="all-stem"; note="keep ${keep} per stem, all stems"
     if hf_prune_atime_ok "$prof"; then
@@ -370,7 +436,7 @@ hf_prune_root() {
     rm -f "$own" "$hot"
     if [ "$lvl" -ge 2 ]; then
       # Level 2+: incremental sessions are the cheapest thing to rebuild.
-      [ -d "$prof/incremental" ] && find "$prof/incremental" -mindepth 1 -maxdepth 1 -type d -mmin +"${HF_CI_PRUNE_MIN_AGE_MIN:-60}" -printf '0\t%f\t%f\n' 2>/dev/null |
+      [ -d "$prof/incremental" ] && [ ! -L "$prof/incremental" ] && find -P "$prof/incremental" -mindepth 1 -maxdepth 1 -type d -mmin +"${HF_CI_PRUNE_MIN_AGE_MIN:-60}" -printf '0\t%f\t%f\n' 2>/dev/null |
         hf_prune_apply "$prof/incremental" du "incremental dirs (all)"
     else
       hf_prune_select "$prof/incremental" d "$ik" any "$cutoff" | hf_prune_apply "$prof/incremental" du "incremental dirs"
@@ -384,15 +450,16 @@ hf_prune_root() {
         c=$(basename "$exe" | tr '-' '_')
         pats+=( -o -name "${c}-*" -o -name "lib${c}-*" )
       done
-      find "$prof/deps" -maxdepth 1 -type f \( "${pats[@]}" \) -mmin +"${HF_CI_PRUNE_MIN_AGE_MIN:-60}" -printf '%b\t%f\t%f\n' 2>/dev/null |
+      find -P "$prof/deps" -maxdepth 1 -type f \( "${pats[@]}" \) -mmin +"${HF_CI_PRUNE_MIN_AGE_MIN:-60}" -printf '%b\t%f\t%f\n' 2>/dev/null |
         hf_prune_apply "$prof/deps" blocks "own-crate artifact files (all)"
     fi
   done
   # Scratch dirs that only ever accumulate.
   for junk in ${HF_CI_PRUNE_JUNK:-cargo-timings:1 tmp:7 sqlx-prepare-check:7}; do
     jn=${junk%%:*}; jd=${junk##*:}
-    [ -d "$r/$jn" ] || continue
-    find "$r/$jn" -mindepth 1 -maxdepth 1 -mtime +"$jd" -printf '0\t%f\t%f\n' 2>/dev/null |
+    case "$jn" in ''|.|..|*/*) continue;; esac
+    [ -d "$r/$jn" ] && [ ! -L "$r/$jn" ] || continue
+    find -P "$r/$jn" -mindepth 1 -maxdepth 1 -mtime +"$jd" -printf '0\t%f\t%f\n' 2>/dev/null |
       hf_prune_apply "$r/$jn" du "${jn} entries older than ${jd}d"
   done
   return 0
@@ -443,12 +510,12 @@ hf_prune_rootfs_due() {
     [ "$free_kb" -lt $(( ${HF_CI_PRUNE_L1_GB:-20} * 1048576 )) ] && return 0
     stamp="${HF_CI_CACHE:-}/.floor-stamp"
     [ -f "$stamp" ] || return 0
-    [ -z "$(find "$stamp" -mmin -"${HF_CI_ROOT_FLOOR_COOLDOWN_MIN:-30}" 2>/dev/null)" ] && return 0
+    [ -z "$(find -P "$stamp" -mmin -"${HF_CI_ROOT_FLOOR_COOLDOWN_MIN:-30}" 2>/dev/null)" ] && return 0
   fi
   if [ -n "${HF_CI_CACHE_CAPS:-}" ] || [ -n "${HF_CI_BUILDER_CONTAINER:-}" ]; then
     stamp="${HF_CI_CACHE:-}/.cap-stamp"
     [ -f "$stamp" ] || return 0
-    [ -z "$(find "$stamp" -mmin -"${HF_CI_CAP_CHECK_MIN:-60}" 2>/dev/null)" ] && return 0
+    [ -z "$(find -P "$stamp" -mmin -"${HF_CI_CAP_CHECK_MIN:-60}" 2>/dev/null)" ] && return 0
   fi
   return 1
 }
@@ -512,7 +579,7 @@ hf_prune_rootfs() {
   if [ "$free_kb" -lt $((floor_gb * 1048576)) ]; then
     stamp="$HF_CI_CACHE/.floor-stamp"
     if [ "$dry" != 1 ] && [ "$free_kb" -ge $(( ${HF_CI_PRUNE_L1_GB:-20} * 1048576 )) ] \
-       && [ -f "$stamp" ] && [ -n "$(find "$stamp" -mmin -"${HF_CI_ROOT_FLOOR_COOLDOWN_MIN:-30}" 2>/dev/null)" ]; then
+       && [ -f "$stamp" ] && [ -n "$(find -P "$stamp" -mmin -"${HF_CI_ROOT_FLOOR_COOLDOWN_MIN:-30}" 2>/dev/null)" ]; then
       echo " floor: acted less than ${HF_CI_ROOT_FLOOR_COOLDOWN_MIN:-30} min ago, cooling down"
     else
       echo " floor: root fs under ${floor_gb} GB free, pruning CI-owned data on it (oldest first)"
@@ -521,7 +588,7 @@ hf_prune_rootfs() {
       if [ "$dry" = 1 ] || [ "$free_kb" -lt $((floor_gb * 1048576)) ]; then
         echo " floor: $((free_kb / 1048576)) GB free after builder prune, level-1 prune of cache roots on the root fs"
         for r in "$HF_CI_CACHE"/*/target*; do
-          [ -d "$r" ] && hf_prune_on_rootfs "$r" || continue
+          hf_prune_root_ok "$r" && hf_prune_on_rootfs "$r" || continue
           echo "root ${r}: floor-driven level 1"
           hf_prune_root_locked "$r" 1 "$cutoff"
         done
@@ -532,18 +599,20 @@ hf_prune_rootfs() {
   fi
   if [ -n "${HF_CI_CACHE_CAPS:-}" ] || [ -n "${HF_CI_BUILDER_CONTAINER:-}" ]; then
     stamp="$HF_CI_CACHE/.cap-stamp"
-    if [ "$dry" = 1 ] || [ ! -f "$stamp" ] || [ -z "$(find "$stamp" -mmin -"${HF_CI_CAP_CHECK_MIN:-60}" 2>/dev/null)" ]; then
+    if [ "$dry" = 1 ] || [ ! -f "$stamp" ] || [ -z "$(find -P "$stamp" -mmin -"${HF_CI_CAP_CHECK_MIN:-60}" 2>/dev/null)" ]; then
       for entry in ${HF_CI_CACHE_CAPS:-}; do
         repo=${entry%%:*}; cap=${entry##*:}
+        # A repo name is one plain path component: no separator, no "..".
+        case "$repo" in ''|.|..|*..*|*[!A-Za-z0-9._-]*) echo " cap: bad repo name in '${entry}', skipped"; continue;; esac
         dir="$HF_CI_CACHE/$repo"
         case "$cap" in ''|*[!0-9]*) echo " cap: bad entry '${entry}', skipped"; continue;; esac
-        [ -d "$dir" ] || { echo " cap: ${dir} missing, skipped"; continue; }
+        [ -d "$dir" ] && [ ! -L "$dir" ] || { echo " cap: ${dir} missing or a symlink, skipped"; continue; }
         du_kb=$(du -sk "$dir" 2>/dev/null | awk '{ print $1 }')
         echo " cap: ${repo} cache $((${du_kb:-0} / 1048576)) GB (cap ${cap} GB)"
         if [ "${du_kb:-0}" -gt $((cap * 1048576)) ]; then
           echo " cap: ${repo} over the cap, level-1 prune of its target dirs"
           for r in "$dir"/target*; do
-            [ -d "$r" ] || continue
+            hf_prune_root_ok "$r" || continue
             echo "root ${r}: cap-driven level 1"
             hf_prune_root_locked "$r" 1 "$cutoff"
           done
@@ -564,6 +633,10 @@ hf_prune_rootfs() {
 # root, the runners write the markers as their own user).
 hf_prune_markers() {
   local dir="${HF_CI_TESTED_TREES_DIR:-$HF_CI_CACHE/shared/tested-trees}" days="${HF_CI_TESTED_TREES_DAYS:-30}" ref n kb
+  # Never act through a link: not on a linked marker dir, and not on a default
+  # location whose path runs through a link that leaves the cache root.
+  if [ -L "$dir" ]; then echo " tested-trees: ${dir} is a symlink, skipped"; return 0; fi
+  case "$dir" in "$HF_CI_CACHE"/*) hf_prune_within "$dir" "$HF_CI_CACHE" || { echo " tested-trees: ${dir} resolves outside the cache root, skipped"; return 0; };; esac
   if [ ! -d "$dir" ]; then
     if [ "${PRUNE_DRY_RUN:-0}" = "1" ]; then echo " tested-trees: ${dir} missing, would create it"; return 0; fi
     ref="$HF_CI_CACHE/shared"; [ -d "$ref" ] || ref="$HF_CI_CACHE"
@@ -571,15 +644,15 @@ hf_prune_markers() {
     echo " tested-trees: created ${dir}"
     return 0
   fi
-  n=$(find "$dir" -type f -mmin +$((days * 1440)) 2>/dev/null | wc -l | tr -d ' ')
+  n=$(find -P "$dir" -type f -mmin +$((days * 1440)) 2>/dev/null | wc -l | tr -d ' ')
   if [ "${n:-0}" -gt 0 ]; then
-    kb=$(find "$dir" -type f -mmin +$((days * 1440)) -printf '%b\n' 2>/dev/null | awk '{ s += $1 } END { print int(s / 2) }')
+    kb=$(find -P "$dir" -type f -mmin +$((days * 1440)) -printf '%b\n' 2>/dev/null | awk '{ s += $1 } END { print int(s / 2) }')
   fi
   if [ "${PRUNE_DRY_RUN:-0}" = "1" ]; then
     echo " tested-trees: would remove ${n:-0} marker(s) older than ${days} d (${dir}): $((${kb:-0} / 1024)) MB"
   else
-    find "$dir" -type f -mmin +$((days * 1440)) -delete 2>/dev/null
-    find "$dir" -mindepth 1 -type d -empty -mmin +$((days * 1440)) -delete 2>/dev/null
+    find -P "$dir" -type f -mmin +$((days * 1440)) -delete 2>/dev/null
+    find -P "$dir" -mindepth 1 -type d -empty -mmin +$((days * 1440)) -delete 2>/dev/null
     echo " tested-trees: removed ${n:-0} marker(s) older than ${days} d (${dir})"
   fi
   return 0
@@ -607,6 +680,7 @@ hf_prune_main() {
   hf_prune_markers
   for r in "$HF_CI_CACHE"/*/target*; do
     [ -d "$r" ] || continue
+    hf_prune_root_ok "$r" || { echo "root ${r}: symlink or outside the cache root, skipped"; continue; }
     lvl=$(hf_prune_level "$r") || { echo "root ${r}: df failed, skipped"; continue; }
     [ "$lvl" = 0 ] && [ "$daily" = 1 ] && lvl=1
     before=$(df -Pk "$r" 2>/dev/null | awk 'NR==2 { printf "%.1f", $4 / 1048576 }')
@@ -645,6 +719,7 @@ hf_prune_main() {
 # holds. Without docker or the image the prune is skipped, never run inline.
 hf_prune_launch() {
   local image v envargs=() cgp=() script fns
+  hf_prune_relaunch_ok || return 0
   hf_prune_gate || return 0
   for v in HF_CI_CACHE HF_CI_PRUNE_L1_GB HF_CI_PRUNE_L2_GB HF_CI_PRUNE_L3_GB \
            HF_CI_PRUNE_K1 HF_CI_PRUNE_K2 HF_CI_PRUNE_K3 HF_CI_PRUNE_MIN_AGE_MIN \
@@ -662,7 +737,7 @@ hf_prune_launch() {
     image=$(docker inspect --format '{{.Config.Image}}' "$(hostname)" 2>/dev/null)
   fi
   if [ -n "$image" ] && command -v docker >/dev/null 2>&1 && docker image inspect "$image" >/dev/null 2>&1; then
-    fns=$(declare -f hf_prune_awklib hf_prune_level hf_prune_daily_due hf_prune_select hf_prune_select_tp \
+    fns=$(declare -f hf_prune_awklib hf_prune_within hf_prune_root_ok hf_prune_level hf_prune_daily_due hf_prune_select hf_prune_select_tp \
                      hf_prune_own_stems hf_prune_atime_index hf_prune_atime_ok hf_prune_apply \
                      hf_prune_root hf_prune_volumes hf_prune_rootfs_free_kb hf_prune_on_rootfs \
                      hf_prune_rootfs_due hf_prune_root_locked hf_prune_builder hf_prune_rootfs \
@@ -674,6 +749,7 @@ hf_prune_main >> \"\$HF_CI_CACHE/prune.log\" 2>&1"
          -v "${HF_CI_CACHE}:${HF_CI_CACHE}" -v /var/run/docker.sock:/var/run/docker.sock \
          "$image" 1800 bash -c "$script" >/dev/null 2>&1
     then
+      touch "$HF_CI_CACHE/.launch-stamp" 2>/dev/null
       echo "job-completed hook: cache prune started as root in the background (log: ${HF_CI_CACHE}/prune.log)"
     else
       echo "job-completed hook: cache prune already running (or docker refused); skipped"
@@ -731,7 +807,24 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   wipe_cgp=()
   [ -n "${HF_CI_CGROUP_PARENT:-}" ] && wipe_cgp=( --cgroup-parent "$HF_CI_CGROUP_PARENT" )
 
-  if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -n "${RUNNER_WORK_PREFIX}" ] && [ "${GITHUB_WORKSPACE#"$RUNNER_WORK_PREFIX"}" != "$GITHUB_WORKSPACE" ]; then
+  # Depth floor, so a bad GITHUB_WORKSPACE can never wipe a top-level directory:
+  # absolute, at least 3 path components, no "." or ".." component, and not the
+  # prefix itself.
+  ws_bad=""
+  if [ -n "${GITHUB_WORKSPACE:-}" ]; then
+    ws_slashes=${GITHUB_WORKSPACE%/}; ws_slashes=${ws_slashes//[!\/]/}
+    case "$GITHUB_WORKSPACE" in
+      /*) ;;
+      *) ws_bad="not an absolute path" ;;
+    esac
+    case "${GITHUB_WORKSPACE%/}/" in
+      */../*|*/./*|*//*) ws_bad="contains ., .. or an empty path component" ;;
+    esac
+    [ "${#ws_slashes}" -ge 3 ] || ws_bad="fewer than 3 path components"
+    [ "${GITHUB_WORKSPACE%/}" != "${RUNNER_WORK_PREFIX%/}" ] || ws_bad="equals RUNNER_WORK_PREFIX"
+  fi
+
+  if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -n "${RUNNER_WORK_PREFIX}" ] && [ -z "$ws_bad" ] && [ "${GITHUB_WORKSPACE#"$RUNNER_WORK_PREFIX"}" != "$GITHUB_WORKSPACE" ]; then
     wipe_outcome=""
     if command -v docker >/dev/null 2>&1; then
       if docker run --rm "${wipe_cgp[@]}" -v "${GITHUB_WORKSPACE}:/w" "$HOOK_WIPE_IMAGE" \
@@ -750,7 +843,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     fi
     echo "job-completed hook: cleared GITHUB_WORKSPACE ${GITHUB_WORKSPACE} (${wipe_outcome})"
   else
-    echo "job-completed hook: GITHUB_WORKSPACE (${GITHUB_WORKSPACE:-unset}) not under RUNNER_WORK_PREFIX (${RUNNER_WORK_PREFIX:-unset}) — skipped"
+    echo "job-completed hook: GITHUB_WORKSPACE (${GITHUB_WORKSPACE:-unset}) not under RUNNER_WORK_PREFIX (${RUNNER_WORK_PREFIX:-unset})${ws_bad:+, or refused: $ws_bad} — skipped"
   fi
 
   secret_removed_count=0

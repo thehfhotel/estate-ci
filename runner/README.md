@@ -235,6 +235,9 @@ is normally `<work-dir>/<repo>/<repo>`, so two levels up recovers
 Set `RUNNER_WORK_PREFIX` explicitly — to the host-path prefix shared by every
 `RUNNER_WORKDIR` on your box — when several runners or repos share one host
 and you want the hook to refuse to touch anything outside a known work root.
+Independent of the prefix, the wipe also refuses a workspace that is not an
+absolute path, has fewer than 3 path components, contains a `.` or `..`
+component, or equals the prefix itself, and logs why.
 
 ## Job rows: the job-started and job-completed hooks
 
@@ -360,8 +363,11 @@ build reuses an old third-party artifact WITHOUT touching its mtime:
 - **Own crates** (the repository's workspace crates): the newest K variants per
   stem are kept by mtime and every file or directory of an older variant is
   removed. Every commit produces new own variants and never reuses old ones, so
-  recency is the right measure, and the variant a build in flight needs is
-  always among the kept ones.
+  recency is the right measure. A build that wrote its variant in the last
+  `HF_CI_PRUNE_MIN_AGE_MIN` minutes is never touched; a fully fresh build that
+  reuses an older own variant (say the 9th newest) is not protected unless it
+  holds `test-backend.lock`, which makes the prune skip that repo at levels 1
+  and 2.
 - **Third-party crates** (registry and git dependencies, and every
   `build_script_*` stem): a variant is deleted only when its **atime** is older
   than the level's day count (3 days at level 1, 1 day at level 2, anything
@@ -376,8 +382,13 @@ build reuses an old third-party artifact WITHOUT touching its mtime:
   profile dir, plus anything named in `HF_CI_PRUNE_OWN`. The prune never counts
   `.d` files in the atime index, because reading them to classify crates bumps
   their atime.
-- **atime needs a suitable mount.** `relatime` (the default) is fine, since a
-  day's resolution is enough for a 1-to-3-day rule. If the filesystem under a
+- **atime needs a suitable mount.** `relatime` (the default) is acceptable: it
+  refreshes an atime at most about once a day, so a recorded atime can lag the
+  real last use by up to a day. That is noise at level 1 (3 days), but at level
+  2 (1 day) an artifact read daily can look just over a day old and be evicted
+  right before its next read, and at level 3 (emergency) anything not read in
+  the last hour is a candidate anyway. Both are emergency levels (under 12 GB
+  and 6 GB free) where a rebuild costs less than a full disk. If the filesystem under a
   profile dir is mounted `noatime`, or no own crate is detected, that profile
   falls back to the old rule (newest K by mtime for every stem) and the log line
   says so.
@@ -385,6 +396,16 @@ build reuses an old third-party artifact WITHOUT touching its mtime:
 - `cargo-timings` (older than 1 day), `tmp` and `sqlx-prepare-check` (older than
   7 days) entries under the target dir (`HF_CI_PRUNE_JUNK` to change the list).
 - Nothing modified in the last `HF_CI_PRUNE_MIN_AGE_MIN` minutes (60) is touched.
+
+**Symlinks are never followed.** The cache is writable by every job, and the
+prune runs as root, so a job could plant a link (`<repo>/target-x`, a profile
+dir, `tmp`) to make root delete somewhere else. The prune therefore skips any
+target root, profile dir, scratch dir or candidate that is a symlink, uses
+`find -P` only, and the single delete step (`hf_prune_apply`) refuses unless the
+directory it deletes in resolves under the real path of the root being pruned,
+deleting by relative name from inside that directory. A repo directory that is
+itself a link is refused too. `ops/test-prune.sh` plants such links and checks
+that files outside survive.
 
 **Levels, per filesystem.** The level is decided PER CACHE ROOT from the free
 space of the filesystem that root lives on (`df`), not from one global figure:
@@ -414,7 +435,9 @@ also hosts production, CI data on it is pruned before production runs short:
   level-1 line. The builder is pruned through `buildctl` inside its own
   container, never `docker buildx` as root, which would rewrite the runners'
   `BUILDX_CONFIG` files as root.
-- `HF_CI_CACHE_CAPS="<repo>:<GB> ..."`: when `du` of `$HF_CI_CACHE/<repo>` is over
+- `HF_CI_CACHE_CAPS="<repo>:<GB> ..."` (`<repo>` is one plain name of
+  letters, digits, `.`, `_`, `-`, with no `/` or `..`; other entries are logged
+  and skipped): when `du` of `$HF_CI_CACHE/<repo>` is over
   its cap, that repo's target dirs get a level-1 prune. `du` is slow, so this
   check runs only in the detached prune and at most every `HF_CI_CAP_CHECK_MIN`
   (60) minutes, together with the builder's own keep-cap
@@ -432,6 +455,10 @@ also hosts production, CI data on it is pruned before production runs short:
 - `docker volume prune -f` removes only anonymous volumes on Docker 23 or
   newer; on an older daemon it would also remove unused NAMED volumes, so the
   hook refuses to run it there. Running volumes are never touched.
+- Rate-limited: a launch is skipped when the previous one started less than
+  `HF_CI_PRUNE_RELAUNCH_MIN` (10) minutes ago (stamp `$HF_CI_CACHE/.launch-stamp`),
+  so a disk under the level-1 line does not start a full sweep after every job.
+  Dry runs ignore the limit.
 - Single instance, bounded: the prune runs as root in ONE detached sibling
   container named `hf-ci-prune` (so a second launch fails fast while one runs),
   at idle I/O priority, with a 30-minute hard timeout. Root is required because

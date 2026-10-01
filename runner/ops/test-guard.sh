@@ -31,6 +31,8 @@ check() { # description, test command...
   if "$@"; then ok "$d"; else bad "$d"; fi
 }
 
+quiet() { "$@" >/dev/null; }
+
 # A fresh sandbox: fake HOME with dummy credentials, a fake workspace, a cache root.
 sandbox() {
   S=$T/$1
@@ -41,13 +43,14 @@ sandbox() {
 
 # Run a hook the way the runner does (bash -e), from a clean environment:
 # $1 script, $2 marker value or "unset"; stdout/stderr land in $S/out and $S/err.
+XENV=()   # extra NAME=value pairs for the next run_hook call (they win over the defaults)
 run_hook() {
   local script=$1 marker=$2 mk=()
   [ "$marker" = unset ] || mk=( "HF_CI_RUNNER_CONTAINER=$marker" )
   env -i PATH="$PATH" HOME="$S/home" HF_CI_CACHE="$S/cache" GITHUB_WORKSPACE="$S/work/repo/repo" \
     RUNNER_NAME=guard-test RUNNER_LABELS=test GITHUB_REPOSITORY=org/repo GITHUB_WORKFLOW=CI GITHUB_JOB=j \
     GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 GITHUB_SHA=abc GITHUB_EVENT_NAME=push GITHUB_REF=refs/heads/main \
-    "${mk[@]}" bash -e "$HOOKS/$script" > "$S/out" 2> "$S/err"
+    "${mk[@]}" ${XENV[@]+"${XENV[@]}"} bash -e "$HOOKS/$script" > "$S/out" 2> "$S/err"
   rc=$?
 }
 
@@ -86,6 +89,30 @@ check "job-completed.sh: swept the fake ~/.netrc" test ! -e "$S/home/.netrc"
 check "job-completed.sh: wiped the fake workspace" test ! -e "$S/work/repo/repo/keepme"
 check "job-completed.sh: skipped the prune with a log line (no docker, never inline)" grep -q "prune skipped" "$S/out"
 check "job-completed.sh: no prune ran inline" test ! -e "$S/cache/prune.log"
+
+echo "== workspace wipe depth floor"
+sandbox shallow
+XENV=( "GITHUB_WORKSPACE=$T" "RUNNER_WORK_PREFIX=/" ); echo keep > "$T/shallow-keep"
+run_hook job-completed.sh 1; XENV=()
+check "workspace with 2 path components: exit 0, refused, nothing wiped" test "$rc" -eq 0 -a -f "$T/shallow-keep" -a -f "$S/work/repo/repo/keepme"
+check "workspace with 2 path components: log says refused" grep -q "refused: fewer than 3 path components" "$S/out"
+sandbox eqprefix
+XENV=( "RUNNER_WORK_PREFIX=$S/work/repo/repo" ); run_hook job-completed.sh 1; XENV=()
+check "workspace equal to RUNNER_WORK_PREFIX: refused, not wiped" test -f "$S/work/repo/repo/keepme"
+sandbox dotdot
+mkdir -p "$S/work/other"; echo keep > "$S/work/other/keepme"
+XENV=( "GITHUB_WORKSPACE=$S/work/repo/../other" "RUNNER_WORK_PREFIX=$S" ); run_hook job-completed.sh 1; XENV=()
+check "workspace with a .. component: refused, not wiped" test -f "$S/work/other/keepme"
+
+echo "== job rows stay valid JSON with invalid UTF-8 in a field"
+if command -v jq >/dev/null 2>&1; then
+  sandbox badutf
+  XENV=( "GITHUB_WORKFLOW=$(printf 'bad\377byte \303\251 ok')" ); run_hook job-started.sh 1; XENV=()
+  check "started row with an invalid byte is valid JSON (jq -e)" quiet jq -e -n "[inputs] | length > 0" "$S"/cache/shared/jobs/jobs-*.jsonl
+  check "the valid UTF-8 part of the field survived" grep -q 'byte é ok' "$S"/cache/shared/jobs/jobs-*.jsonl
+else
+  echo "skip jq not installed"
+fi
 
 echo "FAIL=$fail"
 exit "$fail"

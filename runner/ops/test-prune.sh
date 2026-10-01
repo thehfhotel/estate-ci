@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Synthetic test of the cache-prune rules in hooks/job-completed.sh: own crates
+# Synthetic test of the cache-prune rules (incl. planted symlinks that must never be followed) in hooks/job-completed.sh: own crates
 # keep-newest-K by mtime, third-party artifacts by atime, build-script stems never
 # keep-K, the noatime fallback, the freed-space counter. Builds a fake cargo target
 # dir under /tmp, touches nothing else, and needs GNU find/touch (run it on Linux,
@@ -9,6 +9,8 @@
 set -u
 # Refuse outside a container: never run runner scripts on a workstation or the host shell.
 [ -e /.dockerenv ] || { echo "test-prune: refusing to run outside a container (/.dockerenv missing)" >&2; exit 2; }
+# Also refuse when a docker socket is mounted: hf_prune_main would run a real `docker volume prune`.
+[ ! -S /var/run/docker.sock ] || { echo "test-prune: refusing to run with the docker socket mounted" >&2; exit 2; }
 source "${HOOK:-$(dirname "${BASH_SOURCE[0]}")/../hooks/job-completed.sh}"
 T=$(mktemp -d /tmp/prunetest.XXXXXX)
 P=$T/repo/target-ci/debug
@@ -89,6 +91,76 @@ touch -d "40 days ago" $M/o__r/oldtree $M/o__r/.tmp.old123; touch -d "5 days ago
 hf_prune_markers >/dev/null
 for f in oldtree .tmp.old123; do [ ! -e $M/o__r/$f ] && echo "ok   old marker $f removed" || { echo "FAIL $f kept"; fail=1; }; done
 for f in newtree .tmp.new456; do [ -e $M/o__r/$f ] && echo "ok   young marker $f kept" || { echo "FAIL $f removed"; fail=1; }; done
+echo "== symlinks planted in the cache: nothing outside the repo root may be deleted"
+# Each victim holds OLD files that the prune WOULD delete if it followed the link.
+export HF_CI_CACHE=$T/cache
+OUT=$T/outside; mkdir -p $OUT
+old=$((now - 40 * day))
+mkvictim() { # dir: a fake profile (deps/build/.fingerprint/incremental) full of old third-party artifacts plus a tmp junk dir
+  local d=$1 i h
+  mkdir -p $d/debug/deps $d/debug/build $d/debug/.fingerprint $d/debug/incremental $d/tmp
+  echo x > $d/debug/mycrate; chmod +x $d/debug/mycrate
+  for i in 1 2 3; do
+    h=$(hx $((0xd000 + i)))
+    : > $d/debug/deps/libserde-$h.rlib; ts $d/debug/deps/libserde-$h.rlib $old $old
+    echo "$d/debug/deps/mycrate-$h.d: src/lib.rs" > $d/debug/deps/mycrate-$h.d; ts $d/debug/deps/mycrate-$h.d $old $old
+    : > $d/debug/deps/libmycrate-$h.rlib; ts $d/debug/deps/libmycrate-$h.rlib $old $old
+    mkdir -p $d/debug/build/serde-$h $d/debug/.fingerprint/serde-$h $d/debug/incremental/mycrate-$h
+    ts $d/debug/build/serde-$h $old $old; ts $d/debug/.fingerprint/serde-$h $old $old; ts $d/debug/incremental/mycrate-$h $old $old
+  done
+  : > $d/tmp/junk-entry; ts $d/tmp/junk-entry $old $old
+  : > $d/keep-me.txt
+}
+vsnap() { find $1 -mindepth 1 | sort | md5sum | cut -d' ' -f1; }
+# 1. a symlinked target root
+mkvictim $OUT/v1; v1=$(vsnap $OUT/v1)
+mkdir -p $HF_CI_CACHE/rS; ln -s $OUT/v1 $HF_CI_CACHE/rS/target-x
+hf_prune_root $HF_CI_CACHE/rS/target-x 3 $((now - 3600)) | head -3
+[ "$(vsnap $OUT/v1)" = "$v1" ] && echo "ok   symlinked target root: victim untouched" || { echo "FAIL symlinked target root: victim changed"; fail=1; }
+# 2. a symlinked profile dir inside a real target root
+mkvictim $OUT/v2; v2=$(vsnap $OUT/v2)
+mkdir -p $HF_CI_CACHE/rS/target-ci; ln -s $OUT/v2/debug $HF_CI_CACHE/rS/target-ci/debug
+hf_prune_root $HF_CI_CACHE/rS/target-ci 3 $((now - 3600)) | head -3
+[ "$(vsnap $OUT/v2)" = "$v2" ] && echo "ok   symlinked profile dir: victim untouched" || { echo "FAIL symlinked profile dir: victim changed"; fail=1; }
+# 3. a symlinked junk dir (tmp) and symlinked deps/build/.fingerprint/incremental
+mkvictim $OUT/v3; v3=$(vsnap $OUT/v3)
+R3=$HF_CI_CACHE/rS/target-j; mkdir -p $R3/debug; echo x > $R3/debug/mycrate; chmod +x $R3/debug/mycrate
+ln -s $OUT/v3/tmp $R3/tmp
+ln -s $OUT/v3/debug/deps $R3/debug/deps; ln -s $OUT/v3/debug/build $R3/debug/build
+ln -s $OUT/v3/debug/.fingerprint $R3/debug/.fingerprint; ln -s $OUT/v3/debug/incremental $R3/debug/incremental
+hf_prune_root $R3 3 $((now - 3600)) | head -3
+[ "$(vsnap $OUT/v3)" = "$v3" ] && echo "ok   symlinked junk/deps/build/fingerprint/incremental dirs: victim untouched" || { echo "FAIL symlinked sub-dir: victim changed"; fail=1; }
+# 4. symlinks INSIDE deps pointing outside (file and dir): the links are never followed
+mkdir -p $OUT/v4/d; : > $OUT/v4/d/precious; : > $OUT/v4/precious-file; ts $OUT/v4/d/precious $old $old; ts $OUT/v4/precious-file $old $old; v4=$(vsnap $OUT/v4)
+R4=$HF_CI_CACHE/rS/target-k; mkvictim $R4
+h=$(hx $((0xd777))); ln -s $OUT/v4/precious-file $R4/debug/deps/libserde-$h.rlib; ln -s $OUT/v4/d $R4/debug/deps/libserde-$h.rmeta
+ln -s $OUT/v4/d $R4/debug/build/serde-$h; ln -s $OUT/v4/d $R4/tmp/linkjunk; touch -h -d "@$old" $R4/tmp/linkjunk
+hf_prune_root $R4 3 $((now - 3600)) | head -3
+[ "$(vsnap $OUT/v4)" = "$v4" ] && echo "ok   symlinks inside deps/build/tmp: targets untouched" || { echo "FAIL inner symlink followed"; fail=1; }
+[ ! -e $R4/debug/deps/libserde-$(hx $((0xd000+1))).rlib ] && echo "ok   (control) real old artifacts in the same root were pruned" || { echo "FAIL control: real artifacts not pruned, test proves nothing"; fail=1; }
+# 5. a repo dir that is itself a link
+mkvictim $OUT/v5/target-ci; v5=$(vsnap $OUT/v5)
+ln -s $OUT/v5 $HF_CI_CACHE/rL
+hf_prune_root $HF_CI_CACHE/rL/target-ci 3 $((now - 3600)) | head -3
+[ "$(vsnap $OUT/v5)" = "$v5" ] && echo "ok   symlinked repo dir: victim untouched" || { echo "FAIL symlinked repo dir: victim changed"; fail=1; }
+# 6. hf_prune_main end to end over all of the above; and a linked markers dir
+mkdir -p $OUT/v6; : > $OUT/v6/marker; touch -d "90 days ago" $OUT/v6/marker; v6=$(vsnap $OUT/v6)
+rm -rf $HF_CI_CACHE/shared; ln -s $OUT/v6 $HF_CI_CACHE/shared
+HF_CI_PRUNE_LEVEL=3 hf_prune_main >/dev/null 2>&1
+[ "$(vsnap $OUT/v1)" = "$v1" ] && [ "$(vsnap $OUT/v2)" = "$v2" ] && [ "$(vsnap $OUT/v3)" = "$v3" ] && [ "$(vsnap $OUT/v5)" = "$v5" ] && [ "$(vsnap $OUT/v6)" = "$v6" ] \
+  && echo "ok   hf_prune_main over all planted links (incl. linked shared/ markers dir): victims untouched" || { echo "FAIL hf_prune_main followed a link"; fail=1; }
+echo "== HF_CI_CACHE_CAPS entries with a path or .. are rejected"
+mkdir -p $T/capvictim/target-ci; mkvictim $T/capvictim/target-ci; vc=$(vsnap $T/capvictim)
+rm -f $HF_CI_CACHE/shared; mkdir -p $HF_CI_CACHE/shared
+HF_CI_CACHE_CAPS="../capvictim:0 a/b:0 ..:0 :0" PRUNE_DRY_RUN=0 HF_CI_ROOT_FLOOR_GB=0 hf_prune_rootfs $((now - 3600)) | grep -c 'bad repo name' | grep -qx 4 \
+  && [ "$(vsnap $T/capvictim)" = "$vc" ] && echo "ok   bad cap repo names rejected, outside dir untouched" || { echo "FAIL cap entry validation"; fail=1; }
+echo "== relaunch rate limit"
+mkdir -p $HF_CI_CACHE; rm -f $HF_CI_CACHE/.launch-stamp
+hf_prune_relaunch_ok && echo "ok   no stamp: launch allowed" || { echo "FAIL no stamp"; fail=1; }
+touch $HF_CI_CACHE/.launch-stamp
+hf_prune_relaunch_ok && { echo "FAIL fresh stamp allowed a relaunch"; fail=1; } || echo "ok   fresh stamp: relaunch refused"
+touch -d "30 minutes ago" $HF_CI_CACHE/.launch-stamp
+hf_prune_relaunch_ok && echo "ok   30 min old stamp: launch allowed" || { echo "FAIL old stamp"; fail=1; }
 rm -rf "$T"
 echo "FAIL=$fail"
 exit "$fail"
