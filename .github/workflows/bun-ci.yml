@@ -75,8 +75,11 @@ jobs:
       # RUNNER_TOOL_CACHE: it reuses ONE binary at ~/.bun/bin/bun, and only when
       # `bun --revision` equals the requested version. A job that wants another
       # version than the last job on this runner left there downloads it and
-      # overwrites the file. Linking the image's copy of the exact version first
-      # turns that into "Using existing Bun installation". Nothing to link (a
+      # overwrites the file. Copying the image's copy of the exact version first
+      # turns that into "Using existing Bun installation". It is a copy, not a
+      # symlink: when setup-bun's rename fails (EXDEV) it falls back to
+      # copyFileSync, which writes THROUGH a symlink and would overwrite the baked
+      # binary. Nothing to copy (a
       # GitHub-hosted runner, an older image, a range instead of an exact
       # version) is not an error: setup-bun then does what it always did.
       - name: Use preinstalled Bun
@@ -87,8 +90,14 @@ jobs:
           src="${HF_TOOLCHAIN_DIR:-/opt/hf-toolchains}/bun/${BUN_VERSION#v}/bun"
           if [ -x "$src" ]; then
             mkdir -p "$HOME/.bun/bin"
-            ln -sfn "$src" "$HOME/.bun/bin/bun"
-            echo "Linked the preinstalled Bun ${BUN_VERSION#v}"
+            if [ ! -L "$HOME/.bun/bin/bun" ] && [ "$("$HOME/.bun/bin/bun" --version 2>/dev/null || true)" = "${BUN_VERSION#v}" ]; then
+              echo "Bun ${BUN_VERSION#v} is already in place"
+            else
+              # rm first: `cp` onto an old symlink would write through it.
+              rm -f "$HOME/.bun/bin/bun"
+              cp "$src" "$HOME/.bun/bin/bun"
+              echo "Copied the preinstalled Bun ${BUN_VERSION#v}"
+            fi
           else
             echo "No preinstalled Bun ${BUN_VERSION#v} on this runner; setup-bun will resolve it."
           fi

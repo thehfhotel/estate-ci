@@ -149,6 +149,17 @@ check "node still seeded elsewhere" test -f "$CACHE3/node/4.5.6/x64.complete"
 check "python skipped when baked for another path" test ! -e "$CACHE3/Python"
 check "...with a message" grep -q 'skipping Python' "$TMP/rt3.log"
 
+# a lock that cannot be taken in time skips seeding and never fails the start
+CACHE4="$TMP/cache4"
+mkdir -p "$CACHE4" "$TMP/bin-busy"
+printf '#!/bin/sh\nexit 1\n' >"$TMP/bin-busy/flock"
+chmod +x "$TMP/bin-busy/flock"
+PATH="$TMP/bin-busy:$PATH" HF_TOOLCACHE_OWNER="$me" HF_TOOLCACHE_BAKED_PATH="$CACHE4" \
+  bash "$HERE/seed-toolcache.sh" "$BAKED" "$CACHE4" >"$TMP/rt4.log" 2>&1
+check "a lock timeout exits 0" test $? -eq 0
+check "a lock timeout seeds nothing" test ! -e "$CACHE4/node"
+check "a lock timeout is logged" grep -q 'could not get the lock' "$TMP/rt4.log"
+
 # a missing seed or cache is not an error
 check "missing seed dir is a no-op" bash "$HERE/seed-toolcache.sh" "$TMP/nope" "$CACHE"
 

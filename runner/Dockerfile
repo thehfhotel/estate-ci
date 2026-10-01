@@ -92,10 +92,17 @@ RUN set -eux; \
 #   - bun is not a tool-cache tool: setup-bun reuses ONE binary at
 #     ~/.bun/bin/bun when `bun --revision` equals the requested version. Each
 #     version lives under HF_TOOLCHAIN_DIR (not hidden by any mount), and the
-#     estate default is linked at ~/.bun/bin/bun so a fresh container needs no
-#     download for it. bun-ci.yml links the exact version it asks for.
+#     estate default is COPIED to ~/.bun/bin/bun (never symlinked: when
+#     setup-bun's rename fails with EXDEV it falls back to copyFileSync, which
+#     writes THROUGH a symlink and would overwrite the baked copy), so a fresh
+#     container needs no download for it. bun-ci.yml copies the exact version it
+#     asks for.
 ARG TOOLCACHE_BAKED_PATH=/opt/hostedtoolcache
 ARG DEFAULT_BUN_VERSION=1.3.14
+# HF_CI_RUNNER_CONTAINER marks this as the CI runner image. Hooks that delete
+# things (the job-completed credential sweep) refuse to run unless it is set and
+# /.dockerenv exists, so they can never run against a workstation's real HOME.
+ENV HF_CI_RUNNER_CONTAINER=1
 ENV HF_TOOLCHAIN_DIR=/opt/hf-toolchains \
     HF_TOOLCACHE_SEED=/opt/toolcache-seed \
     HF_TOOLCACHE_BAKED_PATH=${TOOLCACHE_BAKED_PATH}
@@ -108,7 +115,7 @@ RUN set -eux; \
     mkdir -p "${TOOLCACHE_BAKED_PATH}"; \
     test -x "${HF_TOOLCHAIN_DIR}/bun/${DEFAULT_BUN_VERSION}/bun"; \
     mkdir -p /home/runner/.bun/bin; \
-    ln -s "${HF_TOOLCHAIN_DIR}/bun/${DEFAULT_BUN_VERSION}/bun" /home/runner/.bun/bin/bun; \
+    install -m 0755 "${HF_TOOLCHAIN_DIR}/bun/${DEFAULT_BUN_VERSION}/bun" /home/runner/.bun/bin/bun; \
     ln -s bun /home/runner/.bun/bin/bunx; \
     chown -R runner:runner "${HF_TOOLCACHE_SEED}" "${HF_TOOLCHAIN_DIR}" /home/runner/.bun; \
     rm -rf /opt/hf-build

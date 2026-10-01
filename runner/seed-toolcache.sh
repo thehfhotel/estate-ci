@@ -12,7 +12,7 @@
 # Rules: idempotent; never overwrites (a <tool>/<version>/<arch> that exists in
 # any form is left alone); a marker `<arch>.complete` is written only after the
 # copy finished, which is what setup-node and setup-python check; one runner at
-# a time per cache (flock), because every runner on a host shares the same
+# a time per cache (flock, with a timeout), because every runner on a host shares the same
 # directory. It never fails the container: the cache is an optimisation.
 set -uo pipefail
 
@@ -61,7 +61,12 @@ seed_all() {
 # The lock lives in the shared cache; the subshell closes it on exit, so it is
 # never inherited by the runner process the entrypoint execs afterwards.
 (
-  flock 9 || exit 0
+  # Bounded: a holder that hangs (a stalled disk) must never block another
+  # runner's start. On timeout this runner skips seeding and starts anyway.
+  flock -w "${HF_TOOLCACHE_LOCK_WAIT:-120}" 9 || {
+    echo "hf-seed-toolcache: could not get the lock on $CACHE in ${HF_TOOLCACHE_LOCK_WAIT:-120}s; skipping seeding"
+    exit 0
+  }
   seed_all
 ) 9>"$CACHE/.seed.lock"
 exit 0

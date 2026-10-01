@@ -57,7 +57,7 @@ keeps each tool:
 |---|---|---|
 | `setup-node` | the tool cache: `$RUNNER_TOOL_CACHE/node/<version>/x64` with a sibling `x64.complete` marker. Any cached version that satisfies the requested range is used (`22` finds `22.x.y`) unless `check-latest` is set. | seed dir, copied at start (below) |
 | `setup-python` | the tool cache: `$RUNNER_TOOL_CACHE/Python/<version>/x64` plus `x64.complete`, matched the same way (`3.13` finds `3.13.x`). | seed dir, copied at start |
-| `setup-bun` | **not** the tool cache. One binary at `~/.bun/bin/bun`, reused only when `bun --revision` equals the requested version exactly (a range like `1.3` never matches); otherwise it downloads and overwrites that file. | `$HF_TOOLCHAIN_DIR/bun/<version>/bun`; the estate default is linked at `~/.bun/bin/bun` |
+| `setup-bun` | **not** the tool cache. One binary at `~/.bun/bin/bun`, reused only when `bun --revision` equals the requested version exactly (a range like `1.3` never matches); otherwise it downloads and overwrites that file. | `$HF_TOOLCHAIN_DIR/bun/<version>/bun`; the estate default is copied to `~/.bun/bin/bun` |
 
 **The bind-mount caveat.** `compose.yml` mounts a host directory over
 `RUNNER_TOOL_CACHE`, so anything baked into the image at that path is hidden at
@@ -71,7 +71,7 @@ the shared directory. A failure is logged and the runner starts anyway, with
 `setup-*` downloading as before. Python is seeded only when `RUNNER_TOOL_CACHE`
 is the path the image was built for.
 
-Bun cannot work that way (one slot, exact match), so `bun-ci.yml` links the
+Bun cannot work that way (one slot, exact match), so `bun-ci.yml` copies the
 image's copy of the exact version it was asked for into `~/.bun/bin/bun` before
 `setup-bun` runs; `setup-bun` then reports "Using existing Bun installation".
 A job that calls `setup-bun` itself gets the estate default for free and can do
@@ -80,7 +80,8 @@ the same for another version:
 ```yaml
       - run: |
           src="${HF_TOOLCHAIN_DIR:-/opt/hf-toolchains}/bun/1.4.2/bun"
-          [ -x "$src" ] && mkdir -p ~/.bun/bin && ln -sfn "$src" ~/.bun/bin/bun || true
+          # copy, never symlink: setup-bun's copy fallback writes through a symlink
+          [ -x "$src" ] && mkdir -p ~/.bun/bin && rm -f ~/.bun/bin/bun && cp "$src" ~/.bun/bin/bun || true
       - uses: oven-sh/setup-bun@<sha>
         with:
           bun-version: 1.4.2
