@@ -9,6 +9,8 @@ near-copy of `deploy.yml`.
 | `.github/workflows/deploy-evergreen.yml` | Reusable — buildx build + push to GHCR, then forced-command SSH deploy over the cloudflared tunnel. |
 | `.github/workflows/bun-ci.yml` | Reusable — `bun install --frozen-lockfile` → typecheck → test → build, each conditional on the script existing. |
 | `.github/actions/evergreen-ssh/` | Composite — pinned, checksum-verified cloudflared plus the deploy key and `known_hosts`. |
+| `.github/actions/route/` | Composite — path-based suite selection and a docs-only short-circuit, for a tiny first job on the express lane. |
+| `.github/actions/tested-tree/` | Composite — record the tree a green PR run tested, and on push to main skip the tests for a tree that already passed (`record` / `check`). |
 | `runner/` | Generic self-hosted runner image (`Dockerfile` + `entrypoint.sh` + `compose.yml` + `hooks/job-completed.sh`) built and run on estate-owned infrastructure. Org-specific values (URL, group, labels, work dir, host paths) are env vars, never baked in. See `runner/README.md`. |
 
 Why it exists: the estate had accumulated fourteen near-copies of the same
@@ -59,6 +61,61 @@ push "removes". So:
 
 The private `hf-erp-portal` repo owns Cloudflare-as-code and the estate's
 network context. That is where topology lives.
+
+## Lanes and run discipline
+
+The self-hosted runners are shared by every private repository, so a job says
+which lane it needs. The reasoning is ADR 0002 (shared-runner admission and run
+discipline); this is the part a workflow author needs.
+
+| Lane | `runs-on` | Takes |
+|---|---|---|
+| Express | `[self-hosted, <site>]` | Short jobs. The runner that does **not** carry the `heavy` label only ever takes these, so a deploy never waits behind a long build. |
+| Heavy | `[self-hosted, <site>, heavy]` | Long or resource-hungry jobs. Also eligible to take short ones when it is free. |
+
+`<site>` is the estate's runner label; it lives in the private ops repository,
+not here. Public repositories never carry a self-hosted label (see below).
+
+**Put `heavy` on** a job whose usual run time is over about 3 minutes, and on:
+Rust builds and test suites, end-to-end stacks (browser tests, a database plus
+the app), docker image builds with a real build graph, anything that builds the
+whole product.
+
+**Leave it off** the `route` job, lint and format checks, typecheck-only jobs,
+small Bun or Python suites, the tested-tree check and record jobs, deploy,
+verify and smoke jobs, and release automation. If a short job is stuck behind a
+heavy one, the fix is to split the heavy work into its own job, not to add the
+label.
+
+When unsure, time the job on a busy runner and go by its p90, not by the quiet
+run you saw once.
+
+**Timeouts and tests on a loaded host.** The runners share their host with
+production, and a busy hour runs that host well past its core count. Size for
+that, not for an idle laptop:
+
+- Set `timeout-minutes` on every job, at about twice the job's busy-hour p90.
+  A hung job holds a runner slot that everyone else is queueing for.
+- A test that passes only when the host is quiet is a flake. Do not assert on
+  wall-clock time, and do not sleep a fixed few seconds for a service to come
+  up; poll its health check with a bounded retry.
+- Give per-test and per-suite timeouts generous headroom (several times the
+  quiet-host figure), and cap parallelism to the runner's CPUs rather than to the
+  host's (`--maxWorkers`, `-j`, `-n`).
+- Fail fast and cheap first: put typecheck, lint and secret scans ahead of the
+  expensive suites so a typo does not cost a full run.
+
+**The patterns, one per ADR decision.** Each repository calls these instead of
+carrying its own:
+
+| Need | Where |
+|---|---|
+| Skip work for a docs-only change; run only the suites a change touches | `.github/actions/route/README.md` |
+| Skip the second full test run of a tree that already passed on its PR | `.github/actions/tested-tree/README.md` |
+| One pipeline per repository, deploy as the final `needs:` job (replaces `workflow_run` plus polling) | `docs/final-deploy-needs.md` |
+| PR runs cancel, main and deploy runs never do | `docs/concurrency.md` |
+| Put CI containers in the CI cgroup slice | `docs/cgroup-parent.md` |
+| Toolchains (Bun, Node, Python) already on the runner image | `runner/README.md`, "Preinstalled toolchains" |
 
 ## Self-hosted runners and the estate's own registry
 
