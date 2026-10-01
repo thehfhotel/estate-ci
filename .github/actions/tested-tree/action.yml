@@ -6,7 +6,7 @@ description: >-
   runs on push to the main branch and outputs `skip-tests` only when the
   marker for HEAD's tree exists AND the GitHub API confirms it: the recorded
   run is in this repository, was a pull_request run, concluded success, and
-  its merge commit has exactly this tree. Anything else, including a missing
+  that run produced a merge commit with exactly this tree. Anything else, including a missing
   marker, an unset HF_CI_CACHE or an API error, outputs `full` (fail closed).
 
   Needs a checkout first. Runs on the self-hosted runner itself, not inside a

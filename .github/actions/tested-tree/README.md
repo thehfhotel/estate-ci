@@ -14,16 +14,21 @@ Two modes, one action:
 ## Use
 
 ```yaml
-# pull_request: the last job, after every test job
+# pull_request: the last job, after every test job. Record only when the tests
+# actually SUCCEEDED: a skipped or failed suite must never vouch for a tree.
 record:
-  needs: [test-backend, test-web]            # every job whose result you rely on
-  if: github.event_name == 'pull_request' && !failure() && !cancelled()
+  needs: [route, test-backend, test-web]     # every job whose result you rely on
+  if: >-
+    github.event_name == 'pull_request' &&
+    needs.route.outputs.docs_only != 'true' &&
+    (needs.test-backend.result == 'success' || needs.test-web.result == 'success') &&
+    !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
   runs-on: [self-hosted, <site>]             # express lane, and NOT a job container
   timeout-minutes: 5
   permissions:
     contents: read
   steps:
-    - uses: actions/checkout@<sha>           # default ref: the merge commit
+    - uses: actions/checkout@<sha>           # default ref: the merge commit (record checks HEAD is it)
       with:
         persist-credentials: false
     - uses: thehfhotel/estate-ci/.github/actions/tested-tree@<sha>
@@ -50,7 +55,9 @@ tree:
         mode: check
 ```
 
-Test jobs then gate on `needs.tree.outputs.result != 'skip-tests'`. The whole
+Skipped suites (the route said a suite is not needed) count as tested only when
+at least one suite really ran green; if `route` said docs-only, or no test job
+succeeded, record nothing. Test jobs on the push side gate on `needs.tree.outputs.result != 'skip-tests'`. The whole
 pipeline, deploy as the final `needs:` job included, is in
 `docs/final-deploy-needs.md`.
 
@@ -91,22 +98,33 @@ merge commit. It writes nothing for a fork PR, for any event but
 ## Why `check` is hardened
 
 A PR run executes the PR branch's own workflow files, so a marker file on disk
-is only a claim: that workflow could write one without testing anything. `check`
-trusts a marker only after the GitHub API confirms all of:
+is only a claim: that workflow could write one without testing anything, or
+name some other, older green run. `check` trusts a marker only after the GitHub
+API confirms all of:
 
-1. the recorded run exists in **this** repository (`actions: read`), the
-   recorded attempt is `completed`, its event is `pull_request`, its
-   conclusion is `success`;
+1. the recorded run attempt exists in **this** repository, its head repository
+   is this repository (no fork), it is `completed`, its event is `pull_request`,
+   its conclusion is `success`, and the attempt number matches;
 2. the recorded merge commit exists and its tree SHA equals `HEAD^{tree}`;
-3. the marker file itself parses, names this repository, and carries the tree
+3. **the run produced that merge commit**: the run's `head_sha` (the PR head
+   commit) is one of the merge commit's parents. Without this tie, a marker
+   could pair any old green run with an untested merge commit that happens to
+   have the right tree;
+4. the marker file itself parses, names this repository, and carries the tree
    it is filed under.
+
+The token is handed to `curl` through a config on stdin, never on its command
+line.
 
 **Fail closed.** A missing marker, unparsable JSON, a malformed field, an API
 error, a mismatch, an unset `HF_CI_CACHE`, a missing `jq` or `curl`, a missing
 token, or an event that is not `push` all output `full`. The only path to
 `skip-tests` is every check passing. Note what this does not stop: someone with
 write access can still make a workflow that is green without testing; the check
-raises the bar from "write a file" to "get a green PR run on that exact tree".
+raises the bar from "write a file" to "get a green PR run that produced a merge
+commit with that exact tree". Markers are plain files writable by any job on the
+same runner user, which is acceptable inside one organisation because a forged
+marker still needs a parent-bound green run to pass `check`.
 Because the conclusion is the whole run's, a PR run with an unrelated red job
 yields no usable marker, and the main run tests in full. That is the safe side.
 
@@ -120,10 +138,8 @@ These are not this action's job; they are what the runner host must provide.
 - `HF_CI_CACHE` exported on the runners and bind-mounted at the identical
   absolute path (see `runner/README.md`, "A shared cache root across runners"),
   so a marker written by one runner is visible to every other.
-- **Prune markers after 30 days** (by mtime, including stray `.tmp.*` files)
-  in the runner's job-completed hook or a timer. The action never deletes
-  markers. Without a prune the directory only grows (one small file per merged
-  PR).
+- The host hook (`runner/hooks`) prunes markers after 30 days, by mtime,
+  including stray `.tmp.*` files. The action never deletes markers.
 - `jq` and `curl` on the runner image (both are in `runner/Dockerfile`).
 - A job container (`container:`) does not see `HF_CI_CACHE`: run both jobs
   directly on the runner.

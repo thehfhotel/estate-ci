@@ -41,15 +41,16 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-set_run() { # set_run <id> <attempt> <event> <status> <conclusion> [repo]
+HEAD_SHA="2222222222222222222222222222222222222222"   # the PR head the run tested
+set_run() { # set_run <id> <attempt> <event> <status> <conclusion> [repo] [head_sha] [head_repo]
   mkdir -p "$API_DIR/repos/$REPO/actions/runs/$1/attempts"
   cat >"$API_DIR/repos/$REPO/actions/runs/$1/attempts/$2" <<J
-{"id": $1, "run_attempt": $2, "event": "$3", "status": "$4", "conclusion": "$5", "repository": {"full_name": "${6:-$REPO}"}}
+{"id": $1, "run_attempt": $2, "event": "$3", "status": "$4", "conclusion": "$5", "head_sha": "${7:-$HEAD_SHA}", "repository": {"full_name": "${6:-$REPO}"}, "head_repository": {"full_name": "${8:-$REPO}"}}
 J
 }
-set_commit() { # set_commit <sha> <tree>
+set_commit() { # set_commit <sha> <tree> [parent head sha]
   mkdir -p "$API_DIR/repos/$REPO/git/commits"
-  echo "{\"sha\": \"$1\", \"tree\": {\"sha\": \"$2\"}}" >"$API_DIR/repos/$REPO/git/commits/$1"
+  echo "{\"sha\": \"$1\", \"tree\": {\"sha\": \"$2\"}, \"parents\": [{\"sha\": \"3333333333333333333333333333333333333333\"}, {\"sha\": \"${3:-$HEAD_SHA}\"}]}" >"$API_DIR/repos/$REPO/git/commits/$1"
 }
 write_marker() { # write_marker <json>
   mkdir -p "$MARKER_DIR"
@@ -196,6 +197,74 @@ set_run 100 1 pull_request completed success
 set_commit "$MERGE" "$OTHER_TREE"
 run "${PUSH[@]}"
 expect "merge commit has a different tree" "result=full" "has tree"
+
+# the run is not tied to the merge commit (the review's bypass): green run, matching tree, wrong pair
+reset
+good_marker
+set_run 100 1 pull_request completed success "" "4444444444444444444444444444444444444444"
+set_commit "$MERGE" "$TREE"
+run "${PUSH[@]}"
+expect "run head_sha not among the merge commit's parents" "result=full" "did not produce"
+
+reset
+good_marker
+set_run 100 1 pull_request completed success
+set_commit "$MERGE" "$TREE" "5555555555555555555555555555555555555555"
+run "${PUSH[@]}"
+expect "merge commit parented on another head" "result=full" "did not produce"
+
+reset
+good_marker
+set_run 100 1 pull_request completed success "" "$HEAD_SHA" "evil/widgets"
+set_commit "$MERGE" "$TREE"
+run "${PUSH[@]}"
+expect "run from a fork head repository" "result=full" "fork"
+
+# attempts: the recorded attempt is what counts
+reset
+good_marker
+set_run 100 1 pull_request completed failure
+set_run 100 2 pull_request completed success
+set_commit "$MERGE" "$TREE"
+run "${PUSH[@]}"
+expect "recorded attempt 1 was red (attempt 2 green) is rejected" "result=full" "rejected"
+
+reset
+write_marker "{\"run_id\": 100, \"run_attempt\": 2, \"repository\": \"$REPO\", \"merge_commit_sha\": \"$MERGE\", \"tree_sha\": \"$TREE\"}"
+set_run 100 2 pull_request completed success
+set_commit "$MERGE" "$TREE"
+run "${PUSH[@]}"
+expect "recorded attempt 2 green passes" "result=skip-tests"
+
+reset
+good_marker
+mkdir -p "$API_DIR/repos/$REPO/actions/runs/100/attempts"
+cat >"$API_DIR/repos/$REPO/actions/runs/100/attempts/1" <<J
+{"id": 100, "run_attempt": 7, "event": "pull_request", "status": "completed", "conclusion": "success", "head_sha": "$HEAD_SHA", "repository": {"full_name": "$REPO"}, "head_repository": {"full_name": "$REPO"}}
+J
+set_commit "$MERGE" "$TREE"
+run "${PUSH[@]}"
+expect "attempt number in the response must match" "result=full" "attempt mismatch"
+
+# record: HEAD must be the merge commit
+reset
+git -C "$repo" commit -q --allow-empty -m other
+run "${PR[@]}"
+expect "record no-ops when HEAD is not GITHUB_SHA" "result=noop" "not the merge commit"
+git -C "$repo" reset -q --hard "$MERGE"
+
+# the token never appears on a command line
+reset
+good_marker
+set_run 100 1 pull_request completed success
+set_commit "$MERGE" "$TREE"
+mkdir -p "$TMP/bin"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" >>"%s/argv"\nexec /usr/bin/curl "$@"\n' "$TMP" >"$TMP/bin/curl"
+chmod +x "$TMP/bin/curl"
+run "${PUSH[@]}" TT_TOKEN=sekrit-token PATH="$TMP/bin:$PATH"
+expect "still skips through a wrapped curl" "result=skip-tests"
+if [[ -s "$TMP/argv" ]] && ! grep -q sekrit-token "$TMP/argv"; then ok_msg="ok:   token is not in curl's argv"; echo "$ok_msg"; else echo "FAIL: token in curl argv (or wrapper unused)"; fails=$((fails + 1)); fi
+rm -f "$TMP/bin/curl"
 
 run TT_MODE=bogus
 if [[ "$(cat "$TMP/log")" == *"mode must be"* ]]; then

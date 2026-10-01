@@ -61,6 +61,11 @@ if [[ "$MODE" == record ]]; then
   [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ && "${GITHUB_RUN_ATTEMPT:-}" =~ ^[0-9]+$ ]] || finish noop "no run id or attempt"
   [[ "${GITHUB_SHA:-}" =~ $HEX_RE ]] || finish noop "GITHUB_SHA is not a commit SHA"
 
+  # The marker vouches for the merge ref's tree, so the workspace must hold it.
+  head_now="$(git rev-parse HEAD 2>/dev/null)" || finish noop "cannot resolve HEAD (is the merge ref checked out?)"
+  [[ "$head_now" == "$GITHUB_SHA" ]] ||
+    finish noop "HEAD ${head_now:0:12} is not the merge commit ${GITHUB_SHA:0:12} (check out the default ref)"
+
   tree="$(git rev-parse "${GITHUB_SHA}^{tree}" 2>/dev/null)" || finish noop "cannot resolve the tree of ${GITHUB_SHA:0:12} (is the merge ref checked out?)"
   [[ "$tree" =~ $HEX_RE ]] || finish noop "unexpected tree id"
 
@@ -102,27 +107,37 @@ read -r run_id attempt m_repo m_merge m_tree extra <<<"$fields"
 [[ "$m_tree" == "$tree" ]] || finish full "marker tree does not match its own file name"
 
 api_get() { # api_get <path> : body on stdout, non-zero on any HTTP or transport error
-  curl -fsS --max-time 20 --retry 2 --retry-connrefused \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Accept: application/vnd.github+json" \
-    -H "X-GitHub-Api-Version: 2022-11-28" \
-    "${API}$1" 2>/dev/null
+  # The token goes in through a curl config on stdin, never on the command line
+  # (argv is visible to every process on a shared host).
+  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" |
+    curl -fsS --max-time 20 --retry 2 --retry-connrefused -K - \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "${API}$1" 2>/dev/null
 }
 
 run_json="$(api_get "/repos/$REPO/actions/runs/$run_id/attempts/$attempt")" ||
   finish full "API error reading run $run_id attempt $attempt"
-verdict="$(jq -er --arg id "$run_id" --arg repo "${REPO,,}" '
+verdict="$(jq -er --arg id "$run_id" --arg att "$attempt" --arg repo "${REPO,,}" '
     if (.id|tostring) != $id then "run id mismatch"
+    elif (.run_attempt|tostring) != $att then "run attempt mismatch"
     elif ((.repository.full_name // "")|ascii_downcase) != $repo then "run belongs to another repository"
+    elif ((.head_repository.full_name // "")|ascii_downcase) != $repo then "run is from a fork or an unknown head repository"
     elif .event != "pull_request" then "run event is " + (.event // "null") + ", not pull_request"
     elif .status != "completed" then "run is " + (.status // "null") + ", not completed"
     elif .conclusion != "success" then "run conclusion is " + (.conclusion // "null")
     else "ok" end' <<<"$run_json" 2>/dev/null)" || finish full "run $run_id response is unparsable"
 [[ "$verdict" == ok ]] || finish full "run $run_id rejected: $verdict"
+# For a pull_request run, head_sha is the PR head commit. It binds the run to
+# the merge commit below: a merge commit has the base tip and the PR head as parents.
+run_head="$(jq -er '.head_sha' <<<"$run_json" 2>/dev/null)" && [[ "$run_head" =~ $HEX_RE ]] ||
+  finish full "run $run_id has no usable head_sha"
 
 commit_json="$(api_get "/repos/$REPO/git/commits/$m_merge")" ||
   finish full "API error reading merge commit ${m_merge:0:12}"
 api_tree="$(jq -er '.tree.sha' <<<"$commit_json" 2>/dev/null)" || finish full "merge commit ${m_merge:0:12} response is unparsable"
 [[ "$api_tree" == "$tree" ]] || finish full "merge commit ${m_merge:0:12} has tree ${api_tree:0:12}, not ${tree:0:12}"
+jq -e --arg h "$run_head" '[.parents[].sha] | index($h) != null' <<<"$commit_json" >/dev/null 2>&1 ||
+  finish full "run $run_id (PR head ${run_head:0:12}) did not produce merge commit ${m_merge:0:12}: its head is not a parent"
 
-finish skip-tests "tree ${tree:0:12} was tested green in PR run $run_id attempt $attempt (merge ${m_merge:0:12})"
+finish skip-tests "tree ${tree:0:12} was tested green in PR run $run_id attempt $attempt (merge ${m_merge:0:12}, PR head ${run_head:0:12})"
