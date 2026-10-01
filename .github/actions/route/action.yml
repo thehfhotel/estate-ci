@@ -1,0 +1,100 @@
+name: "Route: pick the suites a change needs"
+description: >-
+  Path-based suite selection for a tiny first job on the express lane (the
+  runner without the `heavy` label). Diffs the checked-out commit against the
+  PR base (pull_request) or the previous tip (push) and outputs which of the
+  caller's suites the change touches, plus a docs-only short-circuit.
+
+  Fails OPEN: anything it cannot determine (first push, zero base SHA, a base
+  it cannot fetch, an empty diff, a file no suite claims) outputs "run
+  everything". It never skips tests on a guess.
+
+  Needs a checkout first (any depth). The action fetches the base commit
+  itself, with the `token` input, so the checkout may keep
+  persist-credentials: false. See README.md in this directory.
+
+inputs:
+  suites:
+    description: >-
+      Suite mapping, one suite per line: `name: glob [glob...]`. Names are
+      letters, digits, - and _. Globs are anchored at the repo root: ** crosses
+      directories, * does not, a trailing / means everything below. No braces.
+      Empty (the default) means no suites: only docs_only is computed.
+    required: false
+    default: ""
+  docs-globs:
+    description: >-
+      Whitespace or newline separated globs that count as documentation. A
+      change is docs-only when every changed file matches one of them.
+    required: false
+    default: |
+      **/*.md
+      docs/**
+      LICENSE*
+      .github/ISSUE_TEMPLATE/**
+      .github/PULL_REQUEST_TEMPLATE*
+  shared-globs:
+    description: >-
+      Globs that force EVERY suite on when any matching file changes (CI
+      definitions by default; add lockfiles and shared config for your repo).
+    required: false
+    default: |
+      .github/workflows/**
+      .github/actions/**
+  unmatched:
+    description: >-
+      What to do with a changed file that is neither docs nor claimed by any
+      suite. `all` (the default) runs everything; `none` ignores it.
+    required: false
+    default: "all"
+  base-sha:
+    description: >-
+      Override the commit to diff against. Empty derives it from the event:
+      the PR base for pull_request, the previous tip for push.
+    required: false
+    default: ""
+  token:
+    description: "Token for fetching the base commit (needs contents: read)."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  docs_only:
+    description: "'true' when every changed file is documentation. Skip the test jobs."
+    value: ${{ steps.route.outputs.docs_only }}
+  run_all:
+    description: "'true' when the action could not narrow the change (every suite is on)."
+    value: ${{ steps.route.outputs.run_all }}
+  suites:
+    description: >-
+      JSON object, suite name to boolean, e.g. {"backend":true,"web":false}.
+      Read one with fromJSON(needs.route.outputs.suites).backend.
+    value: ${{ steps.route.outputs.suites }}
+  suite_list:
+    description: 'JSON array of the selected suite names, for a matrix: ["backend"].'
+    value: ${{ steps.route.outputs.suite_list }}
+  changed_count:
+    description: "Number of changed files (0 when the diff was not computed)."
+    value: ${{ steps.route.outputs.changed_count }}
+  reason:
+    description: "One line saying why the action decided what it did."
+    value: ${{ steps.route.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - name: Route
+      id: route
+      shell: bash
+      env:
+        ROUTE_SUITES: ${{ inputs.suites }}
+        ROUTE_DOCS_GLOBS: ${{ inputs.docs-globs }}
+        ROUTE_SHARED_GLOBS: ${{ inputs.shared-globs }}
+        ROUTE_UNMATCHED: ${{ inputs.unmatched }}
+        ROUTE_TOKEN: ${{ inputs.token }}
+        ROUTE_BASE_SHA: >-
+          ${{ inputs.base-sha
+          || (github.event_name == 'pull_request' && github.event.pull_request.base.sha)
+          || (github.event_name == 'push' && github.event.before)
+          || '' }}
+      run: bash "${{ github.action_path }}/route.sh"
