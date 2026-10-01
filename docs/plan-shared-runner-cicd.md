@@ -22,6 +22,20 @@ Ground rules for the work itself:
 | A4 | A job-started hook beside job-completed; both append one row per job (repo, workflow, job, lane, queued_at, started_at, finished_at, conclusion, head_sha) | 11 | Rows appear for every job over a full day |
 | A5 | A nightly stray check: any container started by a runner job that is outside `hf-ci` is reported | 10, 12 | Fires on a deliberate stray, silent otherwise |
 
+Status of Wave A (2026-10-02):
+- **A1** done: builder GC cap, 40 GB root floor and the largest-repository cap (`HF_CI_CACHE_CAPS`) in the prune hook.
+- **A4** done: `runner/hooks/job-started.sh` and `job-completed.sh` append one JSON row per
+  hook call (`runner/README.md`, "Job rows"). `queued_at` and `conclusion` stay null; Wave D1
+  fills them from the API by run id.
+- **A5** done report-only: `runner/ops/stray-check.sh`, run nightly from the host's cron. It
+  reports every CI container until A3 puts them in the slice; alerting is Wave D3.
+- **A3** staged for the owner. Finding: systemd reads the dash in `hf-ci.slice` as a hierarchy
+  separator, so the slice is `/hf.slice/hf-ci.slice` and the CPU weight has to sit on the
+  parent `hf.slice` to rank against production. Names in B3 and the stray check are unchanged.
+- Prune fixes shipped with A4: third-party cargo artifacts are deleted by atime (3 days), only
+  the repository's own crates by keep-newest-K; tested-tree markers older than 30 days are
+  pruned (B2's retention); the "freed" counter now sums across the prune's subshells.
+
 ## Wave B: estate-ci building blocks (this repo, one PR per piece)
 
 | # | Item | ADR |

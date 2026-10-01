@@ -11,7 +11,7 @@ near-copy of `deploy.yml`.
 | `.github/actions/evergreen-ssh/` | Composite — pinned, checksum-verified cloudflared plus the deploy key and `known_hosts`. |
 | `.github/actions/route/` | Composite — path-based suite selection and a docs-only short-circuit, for a tiny first job on the express lane. |
 | `.github/actions/tested-tree/` | Composite — record the tree a green PR run tested, and on push to main skip the tests for a tree that already passed (`record` / `check`). |
-| `runner/` | Generic self-hosted runner image (`Dockerfile` + `entrypoint.sh` + `compose.yml` + `hooks/job-completed.sh`) built and run on estate-owned infrastructure. Org-specific values (URL, group, labels, work dir, host paths) are env vars, never baked in. See `runner/README.md`. |
+| `runner/` | Generic self-hosted runner image (`Dockerfile` + `entrypoint.sh` + `compose.yml` + `hooks/` job-started and job-completed hooks + `ops/stray-check.sh`) built and run on estate-owned infrastructure. Org-specific values (URL, group, labels, work dir, host paths) are env vars, never baked in. See `runner/README.md`. |
 
 Why it exists: the estate had accumulated fourteen near-copies of the same
 deploy workflow. Each copy carried its own version of the cloudflared fetch,
