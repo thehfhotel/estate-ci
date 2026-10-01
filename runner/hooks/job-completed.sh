@@ -553,9 +553,10 @@ hf_prune_rootfs() {
 }
 
 # Tested-tree markers (written once by CI, mtime = write time) older than
-# HF_CI_TESTED_TREES_DAYS are deleted, and the directory is created when
-# missing, owned like the shared cache dir above it (the prune runs as root, the
-# runners write the markers as their own user).
+# HF_CI_TESTED_TREES_DAYS are deleted, at any depth and including the dot files
+# (.tmp.*) an interrupted writer leaves behind, and the directory is created
+# when missing, owned like the shared cache dir above it (the prune runs as
+# root, the runners write the markers as their own user).
 hf_prune_markers() {
   local dir="${HF_CI_TESTED_TREES_DIR:-$HF_CI_CACHE/shared/tested-trees}" days="${HF_CI_TESTED_TREES_DAYS:-30}" ref n kb
   if [ ! -d "$dir" ]; then

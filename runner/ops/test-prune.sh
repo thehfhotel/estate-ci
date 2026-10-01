@@ -78,6 +78,15 @@ PRUNE_DRY_RUN=1 HF_CI_PRUNE_K1=2 hf_prune_root $T/repo/target-ci 1 $cut | head -
 unset HF_CI_MOUNTINFO
 echo "== level 3 TP days 0 (emergency): third-party older than min-age atime goes"
 PRUNE_DRY_RUN=1 hf_prune_root $T/repo/target-ci 3 $cut | head -12
+echo "== tested-tree markers: old files (incl. leftover .tmp.*) go, young ones stay, dir created when missing"
+export HF_CI_CACHE=$T/cache; mkdir -p $HF_CI_CACHE/shared
+hf_prune_markers >/dev/null; [ -d $HF_CI_CACHE/shared/tested-trees ] && echo "ok   marker dir created" || { echo "FAIL marker dir not created"; fail=1; }
+M=$HF_CI_CACHE/shared/tested-trees; mkdir -p $M/o__r
+: > $M/o__r/oldtree; : > $M/o__r/.tmp.old123; : > $M/o__r/newtree; : > $M/o__r/.tmp.new456
+touch -d "40 days ago" $M/o__r/oldtree $M/o__r/.tmp.old123; touch -d "5 days ago" $M/o__r/newtree $M/o__r/.tmp.new456
+hf_prune_markers >/dev/null
+for f in oldtree .tmp.old123; do [ ! -e $M/o__r/$f ] && echo "ok   old marker $f removed" || { echo "FAIL $f kept"; fail=1; }; done
+for f in newtree .tmp.new456; do [ -e $M/o__r/$f ] && echo "ok   young marker $f kept" || { echo "FAIL $f removed"; fail=1; }; done
 rm -rf "$T"
 echo "FAIL=$fail"
 exit "$fail"
