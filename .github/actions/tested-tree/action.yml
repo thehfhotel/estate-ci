@@ -1,0 +1,48 @@
+name: "Tested tree: record and check"
+description: >-
+  Skip a second full test run for a tree that already passed. `record` runs as
+  the last job of a green pull_request run and writes the tree hash of the
+  merge ref it tested to a marker on the runner host's shared cache. `check`
+  runs on push to the main branch and outputs `skip-tests` only when the
+  marker for HEAD's tree exists AND the GitHub API confirms it: the recorded
+  run is in this repository, was a pull_request run, concluded success, and
+  that run produced a merge commit with exactly this tree. Anything else, including a missing
+  marker, an unset HF_CI_CACHE or an API error, outputs `full` (fail closed).
+
+  Needs a checkout first. Runs on the self-hosted runner itself, not inside a
+  job container, because the marker lives in the runner's HF_CI_CACHE. See
+  README.md in this directory.
+
+inputs:
+  mode:
+    description: "`record` (last job of a green PR run) or `check` (push to main)."
+    required: true
+  token:
+    description: >-
+      Token for the API checks in `check` mode. The calling job needs
+      `permissions: { contents: read, actions: read }`.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  result:
+    description: "`skip-tests` or `full` (check); `recorded` or `noop` (record)."
+    value: ${{ steps.tree.outputs.result }}
+  skip:
+    description: "'true' when result is `skip-tests`, else 'false'. Convenient in `if:`."
+    value: ${{ steps.tree.outputs.skip }}
+  reason:
+    description: "One line saying why. Also printed in the log and the step summary."
+    value: ${{ steps.tree.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - name: Tested tree
+      id: tree
+      shell: bash
+      env:
+        TT_MODE: ${{ inputs.mode }}
+        TT_TOKEN: ${{ inputs.token }}
+        TT_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+      run: bash "${{ github.action_path }}/tested-tree.sh"
