@@ -172,6 +172,18 @@ job.
 
 ## Workspace hygiene: the job-completed hook
 
+**Never execute runner/hooks or runner/ops scripts on a workstation or the host shell.** The
+credential sweep deletes `~/.ssh`, `~/.config/gh` and other credentials of whoever runs it (it
+has already deleted a workstation's SSH keys once). Test them only inside a throwaway
+`docker run --rm` container, or reason about them.
+
+As a backstop both hooks refuse to run unless `HF_CI_RUNNER_CONTAINER=1` is set AND `/.dockerenv`
+exists: otherwise they print one line to stderr and exit 2 before writing a row, wiping, sweeping
+or pruning. The image and the compose file set the marker for the runner containers. A runner
+that lacks the marker would make every job fail on the hook, so add the marker to the runner
+environment (and recreate the runners) BEFORE installing a guarded hook. `ops/test-guard.sh`
+proves the refusal and the normal path inside a container.
+
 Because runners are persistent (see above), the same `work-N` directory is
 reused, unwiped, across every job that lands on it. A job that does a sparse
 or otherwise narrowed checkout leaves that narrowed tree sitting there for
@@ -191,8 +203,10 @@ env var, pointed at the script's path *inside the container*:
       - ./hooks:/runner-hooks:ro
 ```
 
-After the wipe and the credential sweep the same hook runs the size-gated
-cache prune described under "Cache pruning" below.
+Mount the whole `hooks/` directory, not single files: the hooks source
+`job-row.sh` from their own directory. At the very start the hook writes the
+job's completion row (see "Job rows" below); after the wipe and the credential
+sweep it runs the size-gated cache prune described under "Cache pruning".
 
 The script is deliberately non-fatal (`exit 0` on every path, even a failed
 `rm`) — a hook that fails would fail the job it runs after, which is worse
@@ -221,6 +235,64 @@ is normally `<work-dir>/<repo>/<repo>`, so two levels up recovers
 Set `RUNNER_WORK_PREFIX` explicitly — to the host-path prefix shared by every
 `RUNNER_WORKDIR` on your box — when several runners or repos share one host
 and you want the hook to refuse to touch anything outside a known work root.
+Independent of the prefix, the wipe also refuses a workspace that is not an
+absolute path, has fewer than 3 path components, contains a `.` or `..`
+component, or equals the prefix itself, and logs why.
+
+## Job rows: the job-started and job-completed hooks
+
+For build-time and queue-time statistics every job leaves two rows in a
+CI-owned file. `hooks/job-started.sh` (wired with `ACTIONS_RUNNER_HOOK_JOB_STARTED`,
+exactly like the completed hook) appends the "started" row before the job;
+`hooks/job-completed.sh` appends the "completed" row first thing after it. Both
+use `hooks/job-row.sh`. They need `HF_CI_CACHE` (the shared cache root, see
+below) and write to `$HF_CI_CACHE/shared/jobs/jobs-YYYY-MM.jsonl` (override
+with `HF_CI_JOBS_DIR`; `HF_CI_JOB_ROWS=0` turns the rows off). The rows are
+appended with `>>` under `flock`, make no network call and cost a few
+milliseconds; a failure never fails or delays the job.
+
+```json
+{"v":1,"phase":"completed","repo":"<org>/<repo>","workflow":"CI","job":"build","run_id":"123","run_attempt":"1","runner":"<runner name>","lane":"<labels>","head_sha":"<sha>","event":"push","ref":"refs/heads/main","queued_at":null,"started_at":"2026-10-02T03:04:05.123Z","finished_at":"2026-10-02T03:09:41.456Z","conclusion":null}
+```
+
+- `lane` is the runner's own `RUNNER_LABELS`, comma separated.
+- `job` is the job ID and `workflow` the workflow name; a job's display name is
+  not in the hook environment.
+- `head_sha` is `GITHUB_SHA`: for `pull_request` events that is the merge
+  commit, so pair it with `event` and `ref`.
+- `queued_at` and `conclusion` are not available to a hook and are always
+  `null`. The loader (plan item D1) fills them in from the GitHub API by `run_id`
+  and joins a job's two rows on `(runner, started_at)`: the completed row
+  carries the `started_at` of the started hook that ran just before it on the
+  same runner.
+- Enabling the started hook means adding its env var to the runner
+  environment, which means recreating the runner containers (the hook files
+  themselves are read from the mounted directory on every job).
+
+## Stray check: CI containers outside the CI cgroup slice
+
+The runners mount the host Docker socket, so a job's containers are siblings of
+every other container on the host and sit outside any limit placed on the runner
+containers. The estate's answer (ADR 0002, decision 10) is to put all CI
+containers in one cgroup slice. `ops/stray-check.sh` is the nightly audit for
+that: from the host's cron it lists running containers that belong to CI but
+whose `HostConfig.CgroupParent` is not the slice. The script's header documents
+how a CI container is recognised (the runner's own per-install label, the
+`github_network_*` networks, container names and bind-mount paths) and every
+knob. It is report-only: it appends one block per run to a log
+(`HF_CI_STRAY_LOG`) and wires no pager. Setting `HF_CI_STRAY_ALERT=1` together
+with `HF_CI_STRAY_ALERT_CMD` pipes the report of a run that found strays to that
+command, which is what the alerting wave will use.
+
+```
+15 22 * * *  HF_CI_STRAY_ENV=$HOME/.config/hf-ci/stray-check.env /path/to/stray-check.sh
+```
+
+The header line of each report records the Docker cgroup driver, because the
+slice is named differently under the two (`hf-ci.slice` with the systemd driver,
+`/hf-ci` with cgroupfs). Until the slice exists and the runner, builder and job
+containers join it, the check reports every CI container: that is the baseline,
+not a fault.
 
 ## Scaling past one runner
 
@@ -251,7 +323,7 @@ as `cpus` allows.
 ### A shared cache root across runners
 
 Bind-mount one directory — the *identical* absolute path — into every
-runner container on a box (e.g. `/srv/ci-cache:/srv/ci-cache`), export
+runner container on a box (`<cache-root>:<cache-root>`), export
 that same path as an env var such as `HF_CI_CACHE` on each runner, and
 workflows can derive per-tool cache locations from it (`CARGO_HOME`,
 `CARGO_TARGET_DIR`, `npm_config_cache`, a buildx `BUILDX_CONFIG` state
@@ -283,31 +355,96 @@ is enabled when `HF_CI_CACHE` is set in the runner's environment, and costs one
 `df` per cache root per job unless a prune is actually due.
 
 **What it prunes.** Every `$HF_CI_CACHE/<repo>/target*` directory is treated as
-a cargo target dir. Per profile directory (`debug`, `release`, ...):
+a cargo target dir. Per profile directory (`debug`, `release`, ...), `deps`,
+`build` and `.fingerprint` hold entries named `<stem>-<16 hex>[.ext]`, grouped
+into variants by `(stem, hash)`. Two different rules apply, because a cargo
+build reuses an old third-party artifact WITHOUT touching its mtime:
 
-- `deps`, `build` and `.fingerprint`: entries are named `<stem>-<16 hex>[.ext]`.
-  Variants are grouped by stem and the newest K per stem are kept; every file or
-  directory of an older variant is removed. "Newest" is by mtime, so the variant
-  a build in flight needs is always among the kept ones.
+- **Own crates** (the repository's workspace crates): the newest K variants per
+  stem are kept by mtime and every file or directory of an older variant is
+  removed. Every commit produces new own variants and never reuses old ones, so
+  recency is the right measure. A build that wrote its variant in the last
+  `HF_CI_PRUNE_MIN_AGE_MIN` minutes is never touched; a fully fresh build that
+  reuses an older own variant (say the 9th newest) is not protected unless it
+  holds `test-backend.lock`, which makes the prune skip that repo at levels 1
+  and 2.
+- **Third-party crates** (registry and git dependencies, and every
+  `build_script_*` stem): a variant is deleted only when its **atime** is older
+  than the level's day count (3 days at level 1, 1 day at level 2, anything
+  older than the minimum age at level 3). The variant's atime is the newest
+  atime of any of its files across `deps`, `build` and `.fingerprint`, so a
+  unit whose fingerprint was read by a fully fresh build counts as in use even
+  though its rlib was never opened. Ranking these by mtime evicted artifacts
+  that were still in use and sent a warm 4-minute Rust build back to 28 minutes.
+- **Which is which.** A crate is "own" when the dependency-info file of any of
+  its variants (`deps/*.d`) lists its sources as relative paths (registry and git
+  dependencies list absolute ones), plus the executables at the top of the
+  profile dir, plus anything named in `HF_CI_PRUNE_OWN`. The prune never counts
+  `.d` files in the atime index, because reading them to classify crates bumps
+  their atime.
+- **atime needs a suitable mount.** `relatime` (the default) is acceptable: it
+  refreshes an atime at most about once a day, so a recorded atime can lag the
+  real last use by up to a day. That is noise at level 1 (3 days), but at level
+  2 (1 day) an artifact read daily can look just over a day old and be evicted
+  right before its next read, and at level 3 (emergency) anything not read in
+  the last hour is a candidate anyway. Both are emergency levels (under 12 GB
+  and 6 GB free) where a rebuild costs less than a full disk. If the filesystem under a
+  profile dir is mounted `noatime`, or no own crate is detected, that profile
+  falls back to the old rule (newest K by mtime for every stem) and the log line
+  says so.
 - `incremental/<crate>-<hash>`: the newest K-1 per crate (at least 1) are kept.
 - `cargo-timings` (older than 1 day), `tmp` and `sqlx-prepare-check` (older than
   7 days) entries under the target dir (`HF_CI_PRUNE_JUNK` to change the list).
 - Nothing modified in the last `HF_CI_PRUNE_MIN_AGE_MIN` minutes (60) is touched.
 
+**Symlinks are never followed.** The cache is writable by every job, and the
+prune runs as root, so a job could plant a link (`<repo>/target-x`, a profile
+dir, `tmp`) to make root delete somewhere else. The prune therefore skips any
+target root, profile dir, scratch dir or candidate that is a symlink, uses
+`find -P` only, and the single delete step (`hf_prune_apply`) refuses unless the
+directory it deletes in resolves under the real path of the root being pruned,
+deleting by relative name from inside that directory. A repo directory that is
+itself a link is refused too. `ops/test-prune.sh` plants such links and checks
+that files outside survive.
+
 **Levels, per filesystem.** The level is decided PER CACHE ROOT from the free
 space of the filesystem that root lives on (`df`), not from one global figure:
 
-| Level | When | Keep per stem | Also |
-|---|---|---|---|
-| 0 | at least 40 GB free | | once every 24 h a level-1 sweep runs anyway (stamp file `$HF_CI_CACHE/.prune-stamp`) |
-| 1 | under 40 GB free | 3 | `docker volume prune -f` |
-| 2 | under 20 GB free | 2 | all `incremental` dirs removed |
-| 3 | under 10 GB free | 1 | every own-crate artifact set removed (executables at the top of the profile dir, `test_*`), and the `test-backend.lock` guard is ignored |
+| Level | When | Own crates keep | Third-party atime older than | Also |
+|---|---|---|---|---|
+| 0 | at least 20 GB free | | | once every 24 h a level-1 sweep runs anyway (stamp file `$HF_CI_CACHE/.prune-stamp`) |
+| 1 | under 20 GB free | 8 per stem | 3 days | `docker volume prune -f` |
+| 2 | under 12 GB free | 2 per stem | 1 day | all `incremental` dirs removed |
+| 3 | under 6 GB free | 1 per stem | the minimum age | every own-crate artifact set removed (executables at the top of the profile dir, `test_*`), and the `test-backend.lock` guard is ignored |
 
 The thresholds are `HF_CI_PRUNE_L1_GB`/`L2_GB`/`L3_GB`, the keep counts
-`HF_CI_PRUNE_K1`/`K2`/`K3`. A disk that also hosts production workloads should
-keep the defaults or raise them: pruning starts early enough that the cache can
+`HF_CI_PRUNE_K1`/`K2`/`K3`, the third-party ages
+`HF_CI_PRUNE_TP_DAYS_L1`/`L2`/`L3`. A disk that also hosts production workloads
+should keep these or raise them: pruning starts early enough that the cache can
 never be what fills it.
+
+**Root-filesystem floor and per-repo caps.** When the filesystem that holds `/`
+also hosts production, CI data on it is pruned before production runs short:
+
+- `HF_CI_ROOT_FLOOR_GB` (40): when the root filesystem has less free space, the
+  persistent BuildKit builder cache (`HF_CI_BUILDER_CONTAINER`, unset = no
+  builder steps) is pruned oldest-first down to `HF_CI_BUILDER_FLOOR_KEEP_GB`
+  (20), then, if still under the floor, every cargo target dir that lives on that
+  filesystem gets a level-1 prune. The action repeats at most every
+  `HF_CI_ROOT_FLOOR_COOLDOWN_MIN` (30) minutes, unless free space is under the
+  level-1 line. The builder is pruned through `buildctl` inside its own
+  container, never `docker buildx` as root, which would rewrite the runners'
+  `BUILDX_CONFIG` files as root.
+- `HF_CI_CACHE_CAPS="<repo>:<GB> ..."` (`<repo>` is one plain name of
+  letters, digits, `.`, `_`, `-`, with no `/` or `..`; other entries are logged
+  and skipped): when `du` of `$HF_CI_CACHE/<repo>` is over
+  its cap, that repo's target dirs get a level-1 prune. `du` is slow, so this
+  check runs only in the detached prune and at most every `HF_CI_CAP_CHECK_MIN`
+  (60) minutes, together with the builder's own keep-cap
+  (`HF_CI_BUILDER_KEEP_GB`, 30).
+- Tested-tree markers under `$HF_CI_CACHE/shared/tested-trees`
+  (`HF_CI_TESTED_TREES_DIR`) older than `HF_CI_TESTED_TREES_DAYS` (30) are
+  deleted by mtime; the directory is created, owned like `shared/`, when missing.
 
 **Safety rules.**
 
@@ -318,22 +455,31 @@ never be what fills it.
 - `docker volume prune -f` removes only anonymous volumes on Docker 23 or
   newer; on an older daemon it would also remove unused NAMED volumes, so the
   hook refuses to run it there. Running volumes are never touched.
+- Rate-limited: a launch is skipped when the previous one started less than
+  `HF_CI_PRUNE_RELAUNCH_MIN` (10) minutes ago (stamp `$HF_CI_CACHE/.launch-stamp`),
+  so a disk under the level-1 line does not start a full sweep after every job.
+  Dry runs ignore the limit.
 - Single instance, bounded: the prune runs as root in ONE detached sibling
   container named `hf-ci-prune` (so a second launch fails fast while one runs),
   at idle I/O priority, with a 30-minute hard timeout. Root is required because
   a job that builds inside a `container:` leaves a root-owned target dir that the
   runner user cannot delete. The container image is `HF_CI_PRUNE_IMAGE`, or by
   default the image the runner itself runs (it needs bash, GNU find/awk, flock
-  and the Docker CLI). Without a usable image it falls back to an inline
-  best-effort prune as the runner user.
+  and the Docker CLI). Without docker or a usable image the prune is
+  skipped with a log line: it is never run inline in the hook. `HF_CI_CGROUP_PARENT`, when set, is
+  passed as `--cgroup-parent` to the prune and wipe containers so they join the
+  CI cgroup slice too.
 - It appends one block per run to `$HF_CI_CACHE/prune.log` (free space before
-  and after, what was removed, trimmed at 1 MB) and never fails the job.
+  and after, what was removed, the total freed in cargo caches, trimmed at 1 MB)
+  and never fails the job.
 - Kill switch: `HF_CI_PRUNE=0` in the runner environment.
 
 **Dry run.** `PRUNE_DRY_RUN=1` prints, per root, what would be removed (counts,
 sizes, the heaviest stems) and deletes nothing; it also ignores the gate, previews the level-1
 sweep even when the daily stamp is fresh, and `HF_CI_PRUNE_LEVEL=1|2|3` forces a level so you can preview the
-harsher ones. Run it once before arming the hook, on the real cache, in a
+harsher ones (`HF_CI_ROOT_FLOOR_GB` set above the real free space previews the
+floor action, `HF_CI_PRUNE_TP_DAYS_L1=0` previews the third-party rule on a young
+cache). Run it once before arming the hook, on the real cache, in a
 container so nothing else in the hook runs. The hook script can be `source`d
 (its main flow is guarded), so sourcing it and calling `hf_prune_main` is the
 whole test:
@@ -342,11 +488,18 @@ whole test:
 docker run --rm --user 0:0 --entrypoint bash \
   -e PRUNE_DRY_RUN=1 -e HF_CI_PRUNE_LEVEL=1 -e HF_CI_CACHE="$HF_CI_CACHE" \
   -v "$HF_CI_CACHE:$HF_CI_CACHE" -v /var/run/docker.sock:/var/run/docker.sock \
-  <runner-image> -c 'source /path/to/job-completed.sh; hf_prune_main'
+  -v "$PWD/runner/hooks:/hooks:ro" \
+  <runner-image> -c 'source /hooks/job-completed.sh; hf_prune_main'
 ```
 
 Do not run the whole hook on the host to test it: its credential sweep deletes
 the `$HOME` locations listed above.
+
+`ops/test-prune.sh` (and `ops/test-guard.sh`, for the hook guard) are regression tests; both refuse to run outside a container. The prune test checks the rules above: it builds a fake
+cargo target dir under `/tmp`, runs the prune on it and checks which variants
+survive (own keep-K, third-party atime, build-script stems, the `noatime`
+fallback and the freed-space counter). It needs GNU `find`, so run it on Linux,
+for example `docker run --rm --entrypoint bash -v "$PWD/runner:/r:ro" <runner-image> /r/ops/test-prune.sh`.
 
 ### Docker daemon DNS for a private registry
 

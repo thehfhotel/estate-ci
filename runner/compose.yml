@@ -11,9 +11,9 @@
 # container actions and `uses: docker://` steps run as sibling containers
 # via the mounted docker socket and see host paths, not container paths.
 #
-# Recorded drift (deliberate, not an oversight): the box copy at
-# /sata/hf-ci/runner/ running the actual `hf-ci-runner` compose project is
-# NOT byte-identical to this template. It differs in exactly these ways:
+# Recorded drift (deliberate, not an oversight): the box's own copy, running
+# the actual `hf-ci-runner` compose project, is NOT byte-identical to this
+# template. It differs in exactly these ways:
 #   - `image:` is tagged `hf-runner:<YYYYMMDD>` (the date the image was
 #     built on the box), not `hf-runner:local`.
 #   - `group_add: ["<docker gid>"]` is added — a bare numeric GID with no
@@ -22,10 +22,16 @@
 #     regardless, so this is belt-and-braces, not load-bearing.
 #   - `TZ` is pinned to a fixed zone instead of left at the `${TZ:-UTC}`
 #     default below.
-#   - the box wires the job-completed hook and the shared cache root into every
-#     runner (see the commented block under `environment:`/`volumes:` below and
-#     README.md "Cache pruning"), and sets HF_CI_PRUNE_IMAGE to its own runner
-#     image tag so the prune container matches the runner build.
+#   - the box wires the job-started and job-completed hooks and the shared cache
+#     root into every runner (see the commented block under `environment:` /
+#     `volumes:` below, README.md "Job rows" and "Cache pruning"), sets
+#     HF_CI_PRUNE_IMAGE to its own runner image tag so the prune container
+#     matches the runner build, and sets the box-specific prune knobs
+#     (HF_CI_CACHE_CAPS, HF_CI_BUILDER_CONTAINER, BUILDX_CONFIG) as literal
+#     values in its own compose file.
+#   - once the CI cgroup slice exists (ADR 0002 decision 10), the box adds
+#     `cgroup_parent: hf-ci.slice` to every runner service and
+#     HF_CI_CGROUP_PARENT to the runner environment (commented below).
 #   - RUNNER_HOME is set to the per-runner state dir, bind-mounted at the SAME
 #     absolute path on both sides (see entrypoint.sh), instead of the template's
 #     `${RUNNER_STATE_DIR}:/runner`: container actions mount the runner's
@@ -54,12 +60,21 @@ services:
       RUNNER_WORKDIR: ${RUNNER_WORKDIR:?set the absolute work dir path — identical on host and container}
       RUNNER_TOOL_CACHE: /opt/hostedtoolcache
       TZ: ${TZ:-UTC}
-      # Optional: wire the job-completed hook (workspace wipe, credential sweep,
-      # size-gated cache prune — see README.md). Mount the hooks dir read-only
-      # at the path named here, and give every runner the same cache root.
+      # Marker the job hooks require (together with /.dockerenv) before they wipe
+      # the workspace or sweep $HOME credentials, so they refuse to run on a
+      # workstation. Transitional here: the image sets it too once it is rebuilt.
+      HF_CI_RUNNER_CONTAINER: "1"
+      # Optional: wire the job hooks (job rows, workspace wipe, credential sweep,
+      # size-gated cache prune — see README.md). Mount the WHOLE hooks dir
+      # read-only at the path named here (the hooks source job-row.sh from their
+      # own directory), and give every runner the same cache root.
+      # ACTIONS_RUNNER_HOOK_JOB_STARTED: /runner-hooks/job-started.sh
       # ACTIONS_RUNNER_HOOK_JOB_COMPLETED: /runner-hooks/job-completed.sh
       # HF_CI_CACHE: ${HF_CI_CACHE}
       # HF_CI_PRUNE_IMAGE: hf-runner:<tag>   # defaults to this container's own image
+      # HF_CI_CACHE_CAPS: "<repo>:<GB>"      # du cap per cache repo dir (README "Cache pruning")
+      # HF_CI_BUILDER_CONTAINER: <name>      # persistent BuildKit builder, if any
+      # HF_CI_CGROUP_PARENT: hf-ci.slice     # sibling containers the hooks start join this slice
     volumes:
       # Persistent runner identity + self-update state — see README.md.
       - ${RUNNER_STATE_DIR:?set the host path for this runner's state dir}:/runner
@@ -76,6 +91,9 @@ services:
       # - ${HF_CI_CACHE}:${HF_CI_CACHE}   # identical path on both sides (DooD)
     mem_limit: 4g
     cpus: "2.0"
+    # Join the CI cgroup slice (systemd cgroup driver: a slice name; with the
+    # cgroupfs driver use a path such as /hf-ci). Needs the slice to exist first.
+    # cgroup_parent: hf-ci.slice
     logging:
       driver: json-file
       options:
