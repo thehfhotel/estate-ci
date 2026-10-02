@@ -91,6 +91,47 @@ touch -d "40 days ago" $M/o__r/oldtree $M/o__r/.tmp.old123; touch -d "5 days ago
 hf_prune_markers >/dev/null
 for f in oldtree .tmp.old123; do [ ! -e $M/o__r/$f ] && echo "ok   old marker $f removed" || { echo "FAIL $f kept"; fail=1; }; done
 for f in newtree .tmp.new456; do [ -e $M/o__r/$f ] && echo "ok   young marker $f kept" || { echo "FAIL $f removed"; fail=1; }; done
+echo "== HF_CI_TESTED_TREES_DIR outside the cache root: skipped, nothing deleted or created"
+XO=$T/tt-outside; mkdir -p $XO/sub; : > $XO/oldfile; : > $XO/sub/oldnested; : > $XO/sub/.tmp.old
+touch -d "90 days ago" $XO/oldfile $XO/sub/oldnested $XO/sub/.tmp.old; xo=$(find $XO | sort | md5sum | cut -d' ' -f1)
+for tv in "$XO" "$HF_CI_CACHE/../tt-outside" "$HF_CI_CACHE" "$T"; do
+  for dry in 0 1; do
+    out=$(HF_CI_TESTED_TREES_DIR=$tv PRUNE_DRY_RUN=$dry hf_prune_markers 2>&1)
+    case "$out" in *"not under the cache root, skipped"*) skipped=1;; *) skipped=0;; esac
+    if [ "$skipped" = 1 ] && [ "$(find $XO | sort | md5sum | cut -d' ' -f1)" = "$xo" ] && [ -e $XO/oldfile ] && [ -e $HF_CI_CACHE/shared/tested-trees/o__r/newtree ]; then
+      echo "ok   TESTED_TREES_DIR=${tv#$T/} dry=$dry: skipped, old files untouched"
+    else echo "FAIL TESTED_TREES_DIR=${tv#$T/} dry=$dry: not skipped or files changed ($out)"; fail=1; fi
+  done
+done
+NX=$T/tt-missing; HF_CI_TESTED_TREES_DIR=$NX hf_prune_markers >/dev/null 2>&1
+[ ! -e $NX ] && echo "ok   missing dir outside the cache root is not created" || { echo "FAIL created $NX outside the cache root"; fail=1; }
+ln -s $XO $HF_CI_CACHE/shared/ttlink
+HF_CI_TESTED_TREES_DIR=$HF_CI_CACHE/shared/ttlink hf_prune_markers >/dev/null 2>&1
+[ -e $XO/oldfile ] && echo "ok   marker dir that is a link out of the cache: untouched" || { echo "FAIL followed marker-dir link"; fail=1; }
+rm -f $HF_CI_CACHE/shared/ttlink
+mkdir -p $HF_CI_CACHE/shared/custom; : > $HF_CI_CACHE/shared/custom/oldm; touch -d "90 days ago" $HF_CI_CACHE/shared/custom/oldm
+HF_CI_TESTED_TREES_DIR=$HF_CI_CACHE/shared/custom hf_prune_markers >/dev/null 2>&1
+[ ! -e $HF_CI_CACHE/shared/custom/oldm ] && echo "ok   (control) override under the cache root is still pruned" || { echo "FAIL control: in-cache override not pruned"; fail=1; }
+echo "== hf_prune_apply: exact-directory check after cd (simulated directory swap)"
+# A fake cd lands somewhere other than where it was told: a decoy directory that is
+# still under the prune root (so the within-root check alone would pass), holding
+# entries with the same names. Neither du nor rm may act there.
+AR=$T/applyroot; mkdir -p $AR/real $AR/decoy
+for n in a b; do echo data > $AR/real/$n; echo data > $AR/decoy/$n; done
+hf_prune_base=$(readlink -f $AR); hf_prune_freed_file=$(mktemp)
+cands() { printf '2\tx\ta\n2\tx\tb\n'; }
+# The first cd into the dir (the verification in hf_prune_apply) is honest; every later one (du, rm) is swapped.
+: > $T/cdcount
+cd() { if [ "${1:-}" = -P ] && [ "${3:-}" = "$AR/real" ] && { echo . >> $T/cdcount; [ "$(wc -l < $T/cdcount)" -ge 2 ]; }; then builtin cd -P -- "$AR/decoy"; else builtin cd "$@"; fi; }
+out=$(cands | hf_prune_apply $AR/real du "swapped"); kbswap=$(awk '{s+=$1} END{print int(s)}' $hf_prune_freed_file)
+unset -f cd
+[ -e $AR/decoy/a ] && [ -e $AR/decoy/b ] && [ -e $AR/real/a ] && echo "ok   swapped landing dir: nothing removed in decoy or real dir" || { echo "FAIL swapped landing dir: files removed ($out)"; fail=1; }
+echo "     (du sized 0 KB while swapped: ${kbswap} KB)"
+[ "$kbswap" = 0 ] && echo "ok   swapped landing dir: du sized nothing" || { echo "FAIL du sized the decoy (${kbswap} KB)"; fail=1; }
+: > $hf_prune_freed_file
+out=$(cands | hf_prune_apply $AR/real du "real"); kbreal=$(awk '{s+=$1} END{print int(s)}' $hf_prune_freed_file)
+{ [ ! -e $AR/real/a ] && [ ! -e $AR/real/b ] && [ -e $AR/decoy/a ] && [ "$kbreal" -gt 0 ]; } && echo "ok   (control) unswapped: real dir sized and pruned, decoy untouched" || { echo "FAIL control: apply did not prune the real dir ($out, kb=$kbreal)"; fail=1; }
+rm -f $hf_prune_freed_file; hf_prune_freed_file=""; unset hf_prune_base
 echo "== symlinks planted in the cache: nothing outside the repo root may be deleted"
 # Each victim holds OLD files that the prune WOULD delete if it followed the link.
 export HF_CI_CACHE=$T/cache
