@@ -75,6 +75,35 @@ directories (or none), `**` matches anything, `*` and `?` do not cross a `/`, a
 trailing `/` means everything below. No brace expansion and no character
 classes: list the globs separately.
 
+### Services that hold a person-started session
+
+Some services keep a session that only a person can open again, such as a
+login someone must confirm by hand. Restarting one costs that person a round
+trip, so it must never be rebuilt or redeployed as a side effect. For every
+such service:
+
+- **Gate it on its own suite *and* `run_all != 'true'`.** `run_all` is true
+  on a shared hit, on an unclaimed file under `unmatched: all`, and in every
+  fail-open case (no base, a first push or new branch, `workflow_dispatch`,
+  `schedule`, a base that cannot be fetched, an empty diff). For example:
+  `fromJSON(needs.route.outputs.suites).svc && needs.route.outputs.run_all != 'true'`.
+  `suite_list` also includes the service whenever `run_all` is true. A diff
+  that trips `run_all` therefore holds back the service's own change too;
+  ship it through a `workflow_dispatch` input that selects the service by
+  name (a dispatch alone does not pass the gate: `route` reports
+  `run_all=true` there).
+- **Keep `run_all` rare.** Point `shared-globs` at a path that never exists
+  (do not pass an empty value: GitHub then applies the input's default, which
+  is the workflow globs) and add the workflow globs to the suites that really
+  need to re-run on a CI change. Claim every other path in some suite, or set
+  `unmatched: none`. Otherwise workflow edits and unclaimed files trip
+  `run_all`.
+- **List it per repo.** Name the service in the calling workflow's header so
+  the next editor sees the rule.
+- **Prove it per PR.** Record the `route` job's `suites` output (or its
+  `route: ...` log line) for the PR, showing the service's suite is `false`.
+  After the deploy, confirm the container's start time did not change.
+
 ## Outputs
 
 | Output | Meaning |
