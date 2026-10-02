@@ -69,6 +69,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 ```
 
+`docs/final-deploy-needs.md` uses this per-commit form.
+
 Newer GitHub plans add a `queue: max` property that lets up to 100 runs wait in a
 group instead of replacing the pending one; check that the property is accepted
 on this plan before relying on it.

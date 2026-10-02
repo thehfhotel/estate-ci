@@ -94,7 +94,8 @@
 #                                 root filesystem from inside any container).
 #
 # Tested-tree markers (written once by CI, never touched again):
-#   HF_CI_TESTED_TREES_DIR        default $HF_CI_CACHE/shared/tested-trees
+#   HF_CI_TESTED_TREES_DIR        default $HF_CI_CACHE/shared/tested-trees; must
+#                                 resolve under $HF_CI_CACHE or the prune skips it.
 #   HF_CI_TESTED_TREES_DAYS=30    markers older than this (mtime) are deleted.
 
 # Shared awk helpers for artifact names. parse(name, mode) splits
@@ -367,7 +368,10 @@ hf_prune_apply() {
     if [ "$sizing" = blocks ]; then
       kb=$(awk -F'\t' '{ s += $1 } END { print int(s / 2) }' "$cand")
     else
-      kb=$(cut -f3 "$cand" | tr '\n' '\0' | (cd -P -- "$here" && xargs -0 -r du -sk -- 2>/dev/null) | awk '{ s += $1 } END { print int(s) }')
+      # Same landing check as the delete below: size only the verified directory.
+      kb=$(cut -f3 "$cand" | tr '\n' '\0' |
+        ( cd -P -- "$here" 2>/dev/null && [ "$(pwd -P)" = "$here" ] && hf_prune_within "$here" "$hf_prune_base" && xargs -0 -r du -sk -- 2>/dev/null ) |
+        awk '{ s += $1 } END { print int(s) }')
     fi
     if [ "${PRUNE_DRY_RUN:-0}" = "1" ]; then
       echo "  would remove ${count} ${label}: $((kb / 1024)) MB"
@@ -377,9 +381,10 @@ hf_prune_apply() {
       fi
     else
       # Re-verify the directory we actually landed in (a parent may have been
-      # swapped for a link since the check above) before removing anything.
+      # swapped for a link since the check above) before removing anything: it
+      # must be exactly the directory verified above AND still under the root.
       cut -f3 "$cand" | tr '\n' '\0' |
-        ( cd -P -- "$here" 2>/dev/null && case "$(pwd -P)" in "$(readlink -f -- "$hf_prune_base")"/*) xargs -0 -r rm -rf -- 2>/dev/null;; esac )
+        ( cd -P -- "$here" 2>/dev/null && [ "$(pwd -P)" = "$here" ] && hf_prune_within "$here" "$hf_prune_base" && xargs -0 -r rm -rf -- 2>/dev/null )
       echo "  removed ${count} ${label}: $((kb / 1024)) MB"
       [ -n "${hf_prune_freed_file:-}" ] && echo "$kb" >> "$hf_prune_freed_file"
     fi
@@ -636,7 +641,9 @@ hf_prune_markers() {
   # Never act through a link: not on a linked marker dir, and not on a default
   # location whose path runs through a link that leaves the cache root.
   if [ -L "$dir" ]; then echo " tested-trees: ${dir} is a symlink, skipped"; return 0; fi
-  case "$dir" in "$HF_CI_CACHE"/*) hf_prune_within "$dir" "$HF_CI_CACHE" || { echo " tested-trees: ${dir} resolves outside the cache root, skipped"; return 0; };; esac
+  # Fail closed: whatever the value (env override included), the marker dir must
+  # resolve strictly under the cache root, or nothing is created or deleted.
+  hf_prune_within "$dir" "$HF_CI_CACHE" || { echo " tested-trees: ${dir} is not under the cache root, skipped"; return 0; }
   if [ ! -d "$dir" ]; then
     if [ "${PRUNE_DRY_RUN:-0}" = "1" ]; then echo " tested-trees: ${dir} missing, would create it"; return 0; fi
     ref="$HF_CI_CACHE/shared"; [ -d "$ref" ] || ref="$HF_CI_CACHE"
