@@ -201,6 +201,13 @@ Two more rules for the `deploy` job:
   The `needs:` and the `push` gate above are what keep a red or unreviewed tree
   off production.
 
+Every job **after** `deploy` (a post-deploy verify, smoke or notify job) needs
+the same explicit status function. Skipped jobs anywhere up the chain count, not
+only the ones in its own `needs:`: with `needs: [deploy]` and an `if:` such as
+`github.ref == 'refs/heads/main'`, the implicit `success()` skips the job on
+every push whose tests were skipped by the tested tree, even though `deploy`
+itself ran. Use `!failure() && !cancelled() && needs.deploy.result == 'success'`.
+
 A suite name with a `-` in it needs bracket access: `fromJSON(...)['web-app']`,
 not `.web-app`.
 
