@@ -36,8 +36,12 @@ on:
   push:
     branches: [main]
 
-concurrency:                       # docs/concurrency.md
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+# docs/concurrency.md. Per-commit group on push: this pipeline uses `route`, so
+# no push may queue behind (and be replaced by) another. A `github.ref` group
+# would let a newer push drop an older pending run, whose suites then never run
+# on main. The deploy job's own group serializes the deploys.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -113,15 +117,14 @@ jobs:
   # Pull request only: the last job of a green run vouches for the tree.
   record:
     needs: [route, web, backend]
-    # always(): this `if` has no status function of its own (contains() is not
-    # one), so without it GitHub's implicit success() would skip the job whenever
-    # any suite was skipped. Record only when a suite really ran green; never
-    # when everything was skipped (docs only) or anything failed.
+    # Status functions first: a failed or cancelled job anywhere in the chain
+    # stops it, and a need that was skipped (docs-only route, a suite not
+    # selected) never counts as a pass. Record only when a suite really ran green.
     if: >-
-      always() && github.event_name == 'pull_request' &&
+      ${{ !failure() && !cancelled() &&
+      github.event_name == 'pull_request' &&
       needs.route.outputs.docs_only != 'true' &&
-      (needs.web.result == 'success' || needs.backend.result == 'success') &&
-      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+      (needs.web.result == 'success' || needs.backend.result == 'success') }}
     runs-on: [self-hosted, <site>]
     timeout-minutes: 5
     steps:
@@ -220,7 +223,7 @@ lets the previous main pipeline finish first (ADR decision 6).
    lane and heavy ones on `heavy` (see the README on lanes).
 2. Delete the `workflow_run` deploy workflow and its polling step, and the
    separate push-to-main CI workflow if this pipeline covers it.
-3. Add the concurrency block (`docs/concurrency.md`) and the `route`, `tree` and
+3. Add the concurrency block (`docs/concurrency.md`; the per-commit group, since the pipeline uses `route`) and the `route`, `tree` and
    `record` jobs.
 4. Make `deploy`'s `needs:` the complete list.
 5. Watch the first merge: the `tree` log line and step summary say why it chose
