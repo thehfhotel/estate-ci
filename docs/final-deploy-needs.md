@@ -119,9 +119,12 @@ jobs:
     needs: [route, web, backend]
     # Status functions first: a failed or cancelled job anywhere in the chain
     # stops it, and a need that was skipped (docs-only route, a suite not
-    # selected) never counts as a pass. Record only when a suite really ran green.
+    # selected) never counts as a pass. The contains() guards also catch a single
+    # need cancelled on its own while a sibling succeeded. Record only when a
+    # suite really ran green.
     if: >-
       ${{ !failure() && !cancelled() &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
       github.event_name == 'pull_request' &&
       needs.route.outputs.docs_only != 'true' &&
       (needs.web.result == 'success' || needs.backend.result == 'success') }}
@@ -162,7 +165,7 @@ What each event does:
 | Event | route | tree | tests | record | deploy |
 |---|---|---|---|---|---|
 | `pull_request`, code change | picks suites | skipped | selected suites | runs after a green run | skipped |
-| `pull_request`, docs only | `docs_only` | skipped | skipped | runs | skipped |
+| `pull_request`, docs only | `docs_only` | skipped | skipped | skipped (nothing ran to vouch for the tree) | skipped |
 | push to `main`, tree already tested | picks suites | `skip-tests` | skipped | skipped | build and deploy |
 | push to `main`, tree not tested | picks suites | `full` | selected suites | skipped | after green tests |
 | push to `main`, docs only | `docs_only` | any | skipped | skipped | skipped |

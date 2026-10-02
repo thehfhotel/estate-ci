@@ -19,9 +19,11 @@ Two modes, one action:
 record:
   needs: [route, test-backend, test-web]     # every job whose result you rely on
   # !failure() && !cancelled() first: nothing is recorded when a job failed or the
-  # run was cancelled, and a skipped need (docs-only route) is never a pass.
+  # run was cancelled, and a skipped need (docs-only route) is never a pass. The
+  # contains() guards also catch one need cancelled on its own beside a green one.
   if: >-
     ${{ !failure() && !cancelled() &&
+    !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
     github.event_name == 'pull_request' &&
     needs.route.outputs.docs_only != 'true' &&
     (needs.test-backend.result == 'success' || needs.test-web.result == 'success') }}
