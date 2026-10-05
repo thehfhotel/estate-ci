@@ -10,11 +10,14 @@ FROM ghcr.io/actions/actions-runner:2.337.0
 
 USER root
 
-# docker-ce-cli / buildx / compose plugins from Docker's own apt repo (the
-# base image's Ubuntu repos do not carry them); everything else is a normal
-# Ubuntu package. gosu drops back to the unprivileged runner user in the
-# entrypoint without the signal-handling problems `su`/`sudo` have as PID 1's
-# child.
+# Everything here is a normal Ubuntu package. gosu drops back to the
+# unprivileged runner user in the entrypoint without the signal-handling
+# problems `su`/`sudo` have as PID 1's child. The Docker CLI and buildx are NOT
+# installed from Docker's apt repo: the base image already ships the Docker
+# static bundle (CLI, dockerd, containerd, runc under /usr/bin) and the buildx
+# plugin under /usr/local/lib/docker/cli-plugins, so a second apt copy of both
+# was dead weight (and the plugin dir above wins the lookup anyway). Only the
+# compose plugin is missing; it is added below as a pinned, verified binary.
 # build-essential/pkg-config/libssl-dev/libpq-dev: GitHub-hosted
 # ubuntu-latest ships these by default; this custom image does not, and
 # lint/test jobs that run bare (no `container:`) need `cc` to compile any
@@ -25,7 +28,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
-        gnupg \
         jq \
         git \
         unzip \
@@ -36,19 +38,6 @@ RUN apt-get update \
         pkg-config \
         libssl-dev \
         libpq-dev \
-    && install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
-    && chmod a+r /etc/apt/keyrings/docker.gpg \
-    && echo \
-        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-        $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
-        > /etc/apt/sources.list.d/docker.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        docker-ce-cli \
-        docker-buildx-plugin \
-        docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 # Preinstalled, version-pinned and sha256-verified CLI tools that CI jobs
@@ -61,10 +50,13 @@ RUN apt-get update \
 #     skips its own download when `cloudflared --version` already matches.
 #   - trivy: for Trivy scan steps that call the binary directly instead of
 #     letting a setup action restore it through the (slow) Actions cache.
-ARG CLOUDFLARED_VERSION=2026.7.3
-ARG CLOUDFLARED_SHA256=9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17
-ARG TRIVY_VERSION=0.74.0
-ARG TRIVY_SHA256=2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+#   - docker compose: the CLI plugin the base image lacks (`docker compose`).
+ARG CLOUDFLARED_VERSION=2026.10.0
+ARG CLOUDFLARED_SHA256=d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db
+ARG TRIVY_VERSION=0.75.0
+ARG TRIVY_SHA256=c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+ARG COMPOSE_VERSION=5.6.0
+ARG COMPOSE_SHA256=40343e21ca777173e69cff5dbafeb37c6f81f3b0d57d9e597f036e95eb63e76a
 RUN set -eux; \
     curl -fsSL --retry 3 --max-time 300 -o /tmp/cloudflared \
         "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"; \
@@ -74,9 +66,17 @@ RUN set -eux; \
         "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"; \
     echo "${TRIVY_SHA256}  /tmp/trivy.tgz" | sha256sum -c -; \
     tar -xzf /tmp/trivy.tgz -C /usr/local/bin trivy; \
-    rm -f /tmp/cloudflared /tmp/trivy.tgz; \
+    curl -fsSL --retry 3 --max-time 300 -o /tmp/docker-compose \
+        "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-x86_64"; \
+    echo "${COMPOSE_SHA256}  /tmp/docker-compose" | sha256sum -c -; \
+    install -d -m 0755 /usr/local/lib/docker/cli-plugins; \
+    install -m 0755 /tmp/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose; \
+    rm -f /tmp/cloudflared /tmp/trivy.tgz /tmp/docker-compose; \
     cloudflared --version; \
-    trivy --version
+    trivy --version; \
+    docker --version; \
+    docker buildx version; \
+    docker compose version
 
 # Preinstalled toolchains, so setup-bun / setup-node / setup-python stop
 # downloading them per job. Which versions: toolchains.txt (exact versions and
@@ -98,7 +98,7 @@ RUN set -eux; \
 #     container needs no download for it. bun-ci.yml copies the exact version it
 #     asks for.
 ARG TOOLCACHE_BAKED_PATH=/opt/hostedtoolcache
-ARG DEFAULT_BUN_VERSION=1.3.14
+ARG DEFAULT_BUN_VERSION=1.4.2
 # HF_CI_RUNNER_CONTAINER marks this as the CI runner image. Hooks that delete
 # things (the job-completed credential sweep) refuse to run unless it is set and
 # /.dockerenv exists, so they can never run against a workstation's real HOME.

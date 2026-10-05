@@ -36,8 +36,8 @@ runs:
     - name: Install cloudflared (pinned + verified)
       shell: bash
       env:
-        CLOUDFLARED_VERSION: "2026.7.3"
-        CLOUDFLARED_SHA256: "9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17"
+        CLOUDFLARED_VERSION: "2026.10.0"
+        CLOUDFLARED_SHA256: "d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db"
       run: |
         set -euo pipefail
 

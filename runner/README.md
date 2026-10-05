@@ -26,7 +26,7 @@ rebuilds regardless — see the comment in the Dockerfile).
 
 ### Preinstalled tools
 
-Besides the Docker CLI, buildx and compose, the image carries two CLIs that
+Besides the Docker CLI and buildx (both from the base image) and the compose plugin, the image carries three CLIs that
 jobs would otherwise download on every run, each version-pinned and
 sha256-verified at build time (`ARG`s at the top of the relevant `RUN` in the
 `Dockerfile`; linux/amd64 only):
@@ -35,8 +35,9 @@ sha256-verified at build time (`ARG`s at the top of the relevant `RUN` in the
 |---|---|---|
 | `cloudflared` | `/usr/local/bin/cloudflared` | `.github/actions/evergreen-ssh`, which uses the preinstalled binary when its version equals the action's pin and otherwise downloads the pinned build (60 s limit per attempt) |
 | `trivy` | `/usr/local/bin/trivy` | scan steps that call the binary directly instead of restoring it through the Actions cache |
+| `docker compose` | `/usr/local/lib/docker/cli-plugins/docker-compose` | the Compose CLI plugin, which the base image lacks (Docker CLI and buildx come with the base image) |
 
-To bump either one, change the `ARG` pair in the `Dockerfile`, and for
+To bump one, change its `ARG` pair in the `Dockerfile`, and for
 `cloudflared` the matching pin in the action, then rebuild and recreate the
 runners (an image rebuild never touches a running container).
 
@@ -153,9 +154,9 @@ and the runner user can use Docker without being root. (A `group_add` on the
 container itself is not enough on its own — the target user's supplementary
 groups come from `/etc/group` at the point the process is `gosu`'d into, not
 from anything injected only at the container/cgroup level — which is why the
-entrypoint does this explicitly.) This image installs the Docker CLI, buildx
-and compose plugins for exactly that — building and shipping images IS the
-job.
+entrypoint does this explicitly.) The base image carries the Docker CLI and
+buildx plugin and this image adds the compose plugin, for exactly that —
+building and shipping images IS the job.
 
 ## What this buys, and what it doesn't
 
