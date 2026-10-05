@@ -21,13 +21,13 @@ on:
       bun-version:
         description: >-
           Bun version for oven-sh/setup-bun. Keep it an EXACT version: with a
-          range ("1.3") setup-bun resolves it over the network and cannot
+          range ("1.4") setup-bun resolves it over the network and cannot
           recognise a Bun already on the runner, while an exact match against
           the runner's own install is used as is with no download at all.
           Callers may override it.
         required: false
         type: string
-        default: "1.3.14"
+        default: "1.4.2"
       run_build:
         description: >-
           Run the `build` script when the package declares one. Turn off for a
@@ -67,7 +67,7 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
