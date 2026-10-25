@@ -133,8 +133,9 @@ RUN set -eux; \
 # privilege boundary.
 
 COPY seed-toolcache.sh /usr/local/bin/hf-seed-toolcache
+COPY repair-node-links.sh /usr/local/bin/hf-repair-node-links
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /usr/local/bin/hf-seed-toolcache
+RUN chmod +x /entrypoint.sh /usr/local/bin/hf-seed-toolcache /usr/local/bin/hf-repair-node-links
 
 # Stays root: the entrypoint fixes up ownership of bind-mounted volumes
 # (which land root-owned from the host) before gosu-ing down to `runner`.

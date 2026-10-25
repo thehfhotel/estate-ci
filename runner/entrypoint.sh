@@ -34,6 +34,15 @@ if [ ! -f "${RUNNER_HOME}/config.sh" ]; then
   cp -a "${BASE_RUNNER_INSTALL}/." "${RUNNER_HOME}/"
 fi
 
+# A runner update can unpack externals.<ver>/node*/bin with the npm, npx and
+# corepack symlinks turned into plain copies (2.338.0 did), which breaks every
+# job that runs the bundled npm ("Cannot find module '../lib/cli.js'"). Put the
+# links back before the runner starts. Runs before the chown below so the new
+# links end up runner-owned. Never fails the start. See repair-node-links.sh.
+if command -v hf-repair-node-links >/dev/null 2>&1; then
+  hf-repair-node-links "${RUNNER_HOME}" || true
+fi
+
 # Volumes are bind-mounted from the host and land root-owned; the runner
 # process (and config.sh/run.sh) must own them to work at all.
 chown -R runner:runner "${RUNNER_HOME}"
@@ -126,6 +135,16 @@ if [ -S /var/run/docker.sock ]; then
     groupadd -g "${SOCK_GID}" "${GRP}"
   fi
   usermod -aG "${GRP}" runner
+fi
+
+# Self-update swaps in a new externals.<ver> between jobs, without restarting
+# this container, so the start-time repair above is not enough on its own.
+# Re-check every HF_REPAIR_NODE_LINKS_EVERY seconds (default 15, 0 = off) as
+# the runner user. The check is a few stat calls; it only writes when it finds
+# a dereferenced copy. It stops with the container.
+NODE_LINKS_EVERY="${HF_REPAIR_NODE_LINKS_EVERY:-15}"
+if [ "${NODE_LINKS_EVERY}" != "0" ] && command -v hf-repair-node-links >/dev/null 2>&1; then
+  gosu runner hf-repair-node-links --watch "${NODE_LINKS_EVERY}" "${RUNNER_HOME}" &
 fi
 
 exec gosu runner ./run.sh

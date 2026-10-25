@@ -19,6 +19,12 @@ if [ "${HF_CI_RUNNER_CONTAINER:-}" != "1" ] || [ ! -e /.dockerenv ]; then
 fi
 
 set +e
+# Last line of defence for a runner update that dereferenced the bundled
+# npm/npx/corepack links (the entrypoint also checks at start and every few
+# seconds): repair them right before the job uses them. Best effort.
+if command -v hf-repair-node-links >/dev/null 2>&1; then
+  hf-repair-node-links "${RUNNER_HOME:-/runner}" || true
+fi
 _hf_hooks_dir="${HF_CI_HOOKS_DIR:-$(dirname -- "${BASH_SOURCE[0]:-$0}")}"
 if [ -r "$_hf_hooks_dir/job-row.sh" ]; then
   # shellcheck source=job-row.sh

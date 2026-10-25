@@ -171,6 +171,35 @@ building and shipping images IS the job.
   anything Docker can do on the host. Only run this for repos you already
   trust with equivalent access — never for a public repo (see above).
 
+## Self-update guard: the bundled npm links
+
+The runner's own Node installs (`externals.<ver>/node20` and `node24`) ship
+`bin/npm`, `bin/npx` and `bin/corepack` as symlinks into `lib/node_modules`.
+The 2.338.0 self-update unpacked them as plain copies instead. A copied
+`bin/npm` resolves `require('../lib/cli.js')` from `bin/`, finds nothing, and
+every job that runs the bundled npm (pnpm/action-setup's self-installer, for
+one) fails with `Cannot find module '../lib/cli.js'`. This hit all three
+hfville runners on 2026-10-24.
+
+`repair-node-links.sh` (in the image as `hf-repair-node-links`) puts the six
+links back. It only replaces a regular file whose bytes match its link target,
+swaps atomically, and never fails. It runs:
+
+- once in the entrypoint before the runner starts;
+- every `HF_REPAIR_NODE_LINKS_EVERY` seconds (default `15`, `0` turns it off)
+  in a background loop started by the entrypoint, because self-update happens
+  between jobs without a container restart;
+- at the start of `hooks/job-started.sh`, where that hook is wired.
+
+A runner on an image built before this change can be fixed by hand without
+sudo (the container runs it as the runner user):
+
+```sh
+docker exec -u runner <runner-container> sh -c 'f=$(mktemp); curl -fsSL https://raw.githubusercontent.com/thehfhotel/estate-ci/main/runner/repair-node-links.sh >"$f" && bash "$f" "$RUNNER_HOME"; rm -f "$f"'
+```
+
+Test offline with `bash runner/test-repair-node-links.sh`.
+
 ## Workspace hygiene: the job-completed hook
 
 **Never execute runner/hooks or runner/ops scripts on a workstation or the host shell.** The
