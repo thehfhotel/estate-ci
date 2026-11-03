@@ -250,6 +250,10 @@ in the diff.
 | `compose_path` | no | `docker-compose.yml` | Renamed to `docker-compose.yml` inside the tarball; the run-deploy shim looks for nothing else. |
 | `platforms` | no | `linux/amd64` | |
 | `force_deploy` | no | `false` | Skip the build, re-roll `:latest`. Secret rotation or a wedged container — an empty commit is *not* an alternative, it deploys nothing and reports green. |
+| `smoke_url` | no | `""` | Opt-in post-deploy check: GET until 2xx (see `docs/post-deploy-smoke.md`). Empty = unchanged behaviour. |
+| `smoke_expect` | no | `""` | Text the smoke body must contain; `{tag}` = the deployed image tag. |
+| `smoke_timeout_seconds` | no | `180` | Polling window for the smoke check. |
+| `rollback_on_failure` | no | `false` | On a failed smoke, redeploy the last tag that passed one, re-check, and still fail. Caller grants `statuses: write`. |
 
 | Secret | Req | Notes |
 |---|---|---|
