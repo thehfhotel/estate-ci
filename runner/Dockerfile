@@ -51,12 +51,19 @@ RUN apt-get update \
 #   - trivy: for Trivy scan steps that call the binary directly instead of
 #     letting a setup action restore it through the (slow) Actions cache.
 #   - docker compose: the CLI plugin the base image lacks (`docker compose`).
+#   - gh: GitHub CLI. Self-hosted jobs in new-hotel (record-tested-tree),
+#     loyalty-app, hotel-keycard, kmerchant-etax and kshop-relay call `gh api`
+#     with GITHUB_TOKEN, as they would on ubuntu-latest. The pre-2026-11-03
+#     hfville containers had it only as hand-installed drift, so the rebuild
+#     to 478f56b dropped it and those jobs failed with "gh: command not found".
 ARG CLOUDFLARED_VERSION=2026.10.0
 ARG CLOUDFLARED_SHA256=d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db
 ARG TRIVY_VERSION=0.75.0
 ARG TRIVY_SHA256=c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
 ARG COMPOSE_VERSION=5.6.0
 ARG COMPOSE_SHA256=40343e21ca777173e69cff5dbafeb37c6f81f3b0d57d9e597f036e95eb63e76a
+ARG GH_VERSION=2.103.3
+ARG GH_SHA256=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
 RUN set -eux; \
     curl -fsSL --retry 3 --max-time 300 -o /tmp/cloudflared \
         "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"; \
@@ -71,12 +78,18 @@ RUN set -eux; \
     echo "${COMPOSE_SHA256}  /tmp/docker-compose" | sha256sum -c -; \
     install -d -m 0755 /usr/local/lib/docker/cli-plugins; \
     install -m 0755 /tmp/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose; \
-    rm -f /tmp/cloudflared /tmp/trivy.tgz /tmp/docker-compose; \
+    curl -fsSL --retry 3 --max-time 300 -o /tmp/gh.tgz \
+        "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"; \
+    echo "${GH_SHA256}  /tmp/gh.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/gh.tgz -C /tmp "gh_${GH_VERSION}_linux_amd64/bin/gh"; \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh; \
+    rm -rf /tmp/cloudflared /tmp/trivy.tgz /tmp/docker-compose /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_linux_amd64"; \
     cloudflared --version; \
     trivy --version; \
     docker --version; \
     docker buildx version; \
-    docker compose version
+    docker compose version; \
+    gh --version
 
 # Preinstalled toolchains, so setup-bun / setup-node / setup-python stop
 # downloading them per job. Which versions: toolchains.txt (exact versions and
