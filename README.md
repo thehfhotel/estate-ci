@@ -30,8 +30,9 @@ that changes this — GitHub resolves a `uses:` across repositories against the
 public caller. The reverse direction works fine: a private repo can call a
 public reusable workflow.
 
-Four estate repos are public — `estate-ci`, `ezbookkeeping`, `linen-truck`,
-`reimbursement` — so a private `estate-ci` would serve only the private half
+The public estate repos (checked 2026-11-04) are `estate-ci`, `expense-ledger`,
+`linen-truck` and `reimbursement-v2` (plus the archived `reimbursement`); every one
+of them runs only on GitHub-hosted `ubuntu-latest`. A private `estate-ci` would serve only the private half
 of the estate and the public half would keep its own copies. A public
 `estate-ci` serves all of them. Visibility here is a consequence of that
 arithmetic, not a preference. (The list above has moved over time as repos
