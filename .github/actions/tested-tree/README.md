@@ -8,8 +8,13 @@ Two modes, one action:
 
 | Mode | Runs | Does |
 |---|---|---|
-| `record` | last job of a green `pull_request` run, after every test job | writes the tree hash of the merge ref it tested to a marker file |
+| `record` | last job of a green `pull_request` run, after every test job | writes the tree hash of the merge ref it tested to a marker file, and posts it as a commit status on the PR head |
 | `check` | first job of the `push` to main pipeline | outputs `skip-tests` or `full` |
+
+Two proofs, one verification. The marker file lives on the runner box that ran
+`record`. When jobs of one pipeline can land on different boxes, `check` may run
+where there is no marker; it then finds the proof in the commit status instead.
+Either way the same API verification decides (see "Why `check` is hardened").
 
 ## Use
 
@@ -31,6 +36,7 @@ record:
   timeout-minutes: 5
   permissions:
     contents: read
+    statuses: write                          # optional: the cross-box commit status
   steps:
     - uses: actions/checkout@<sha>           # default ref: the merge commit (record checks HEAD is it)
       with:
@@ -45,8 +51,10 @@ tree:
   runs-on: [self-hosted, <site>]
   timeout-minutes: 5
   permissions:
-    contents: read
-    actions: read                            # the check reads the recorded run
+    contents: read                           # the merge commit
+    actions: read                            # the recorded run
+    pull-requests: read                      # commit -> merged PR (no-marker path)
+    statuses: read                           # the PR head's statuses (no-marker path)
   outputs:
     result: ${{ steps.tree.outputs.result }}
   steps:
@@ -64,6 +72,28 @@ at least one suite really ran green; if `route` said docs-only, or no test job
 succeeded, record nothing. Test jobs on the push side gate on `needs.tree.outputs.result != 'skip-tests'`. The whole
 pipeline, deploy as the final `needs:` job included, is in
 `docs/final-deploy-needs.md`.
+
+## Permissions
+
+Declare them on the job; a job with a `permissions:` block gets nothing it does
+not list.
+
+| Job | Permission | Why |
+|---|---|---|
+| `record` | `contents: read` | checkout |
+| `record` | `statuses: write` | post the `estate-ci/tested-tree` commit status. Optional: without it the POST is refused, a warning is logged and only the local marker is written (the result is still `recorded`) |
+| `check` | `contents: read` | checkout; read the merge commit |
+| `check` | `actions: read` | read the recorded run |
+| `check` | `pull-requests: read` | "List pull requests associated with a commit" (no-marker path) |
+| `check` | `statuses: read` | "List commit statuses for a reference" (no-marker path) |
+
+Per GitHub's REST permission tables, "List pull requests associated with a
+commit" needs the *Pull requests* read permission and "List commit statuses for
+a reference" needs the *Commit statuses* read permission (workflow keys
+`pull-requests` and `statuses`); on a private repository `contents: read` alone
+covers neither. The last two matter only when the box has no marker; a `check`
+job that lacks them still works wherever the marker is local, and otherwise
+answers `full` with a reason that names the missing permission.
 
 ## Outputs
 
@@ -84,6 +114,34 @@ tested. A rebase or squash merge of a PR whose base has not moved gives exactly
 that. If another PR merged in between, the trees differ and `main` runs the full
 tests; that is correct, and it costs one run. Merging one PR at a time per
 repository (ADR 0002, decision 6) keeps the hit rate high.
+
+## Commit status
+
+`record` also posts, on the PR head SHA (`github.event.pull_request.head.sha`),
+`POST /repos/{repo}/statuses/{head_sha}`:
+
+| Field | Value |
+|---|---|
+| `state` | `success` |
+| `context` | `estate-ci/tested-tree` |
+| `target_url` | the run URL |
+| `description` | `run=<run_id> attempt=<run_attempt> merge=<merge_commit_sha> tree=<tree_sha>` (about 110 characters; GitHub allows 140, and a longer description is not posted) |
+
+Nothing is posted for a fork PR, for any event but `pull_request`, or when the
+head SHA is unavailable. A refused POST (no `statuses: write`) is a warning, not
+a failure. The status shows up as a check on the PR; it is informational, so do
+not make it a required check.
+
+`check`, when this box has no marker for `HEAD^{tree}`: lists the merged PRs of
+`GITHUB_SHA` (`GET /repos/{repo}/commits/{sha}/pulls`; same-repository PRs only,
+first three), reads each PR head's statuses (newest first, up to three pages of
+100), keeps the `estate-ci/tested-tree` successes whose four fields parse
+strictly (digits for run and attempt, 40 lowercase hex for merge and tree) and
+whose tree equals `HEAD^{tree}`, and runs the same verification as for a marker,
+plus one more condition: the run's `head_sha` must be that PR head. A present
+but bad local marker is not rescued by a status; the status path is for a
+missing marker only. Squash, rebase and merge-commit merges all resolve to their
+PR through the commits endpoint.
 
 ## Marker
 
@@ -117,15 +175,21 @@ API confirms all of:
 4. the marker file itself parses, names this repository, and carries the tree
    it is filed under.
 
+On the commit-status path, steps 1 to 3 are the same and step 4 is replaced by
+the strict parse above, plus: the run's `head_sha` is the head of the PR the
+status was read from. A status is, like a marker, only a claim: anyone who can
+write statuses can post one, and it counts for nothing unless the run it names
+verifies.
+
 The token is handed to `curl` through a config on stdin, never on its command
 line.
 
-**Fail closed.** A missing marker, unparsable JSON, a malformed field, an API
+**Fail closed.** No proof at all (no marker, and no matching status), unparsable JSON, a malformed field, an API
 error, a mismatch, an unset `HF_CI_CACHE`, a missing `jq` or `curl`, a missing
 token, or an event that is not `push` all output `full`. The only path to
 `skip-tests` is every check passing. Note what this does not stop: someone with
 write access can still make a workflow that is green without testing; the check
-raises the bar from "write a file" to "get a green PR run that produced a merge
+raises the bar from "write a file or a status" to "get a green PR run that produced a merge
 commit with that exact tree". Markers are plain files writable by any job on the
 same runner user, which is acceptable inside one organisation because a forged
 marker still needs a parent-bound green run to pass `check`.
@@ -139,9 +203,11 @@ If the merge commit has been garbage collected by the time the API is asked
 
 These are not this action's job; they are what the runner host must provide.
 
-- `HF_CI_CACHE` exported on the runners and bind-mounted at the identical
-  absolute path (see `runner/README.md`, "A shared cache root across runners"),
-  so a marker written by one runner is visible to every other.
+- `HF_CI_CACHE` exported on the runners (still required by both modes). Where
+  it is bind-mounted at the identical absolute path on every runner (see
+  `runner/README.md`, "A shared cache root across runners"), a marker written by
+  one runner is visible to every other on that box. Across boxes the marker is
+  not shared; the commit status carries the proof instead.
 - The host hook (`runner/hooks`) prunes markers after 30 days, by mtime,
   including stray `.tmp.*` files. The action never deletes markers.
 - `jq` and `curl` on the runner image (both are in `runner/Dockerfile`).
@@ -151,6 +217,7 @@ These are not this action's job; they are what the runner host must provide.
 ## Testing
 
 `bash .github/actions/tested-tree/test.sh` (needs `jq`, `curl`, `python3`):
-a throwaway repo, a cache directory and a mock API. It covers `record`, the one
-`skip-tests` path and every `full` path. Nothing runs it in CI; run it by hand
+a throwaway repo, a cache directory and a mock API (which also records the
+status POSTs). It covers `record` with and without `statuses: write`, the marker
+`skip-tests` path, the commit-status `skip-tests` path and every `full` path. Nothing runs it in CI; run it by hand
 after touching `tested-tree.sh`.

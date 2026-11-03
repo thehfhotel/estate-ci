@@ -1,17 +1,24 @@
 name: "Tested tree: record and check"
 description: >-
   Skip a second full test run for a tree that already passed. `record` runs as
-  the last job of a green pull_request run and writes the tree hash of the
-  merge ref it tested to a marker on the runner host's shared cache. `check`
-  runs on push to the main branch and outputs `skip-tests` only when the
-  marker for HEAD's tree exists AND the GitHub API confirms it: the recorded
-  run is in this repository, was a pull_request run, concluded success, and
-  that run produced a merge commit with exactly this tree. Anything else, including a missing
-  marker, an unset HF_CI_CACHE or an API error, outputs `full` (fail closed).
+  the last job of a green pull_request run: it writes the tree hash of the
+  merge ref it tested to a marker on the runner host's shared cache, and posts
+  an `estate-ci/tested-tree` commit status on the PR head so another runner box
+  can find the proof. `check` runs on push to the main branch and outputs
+  `skip-tests` only when a proof for HEAD's tree exists AND the GitHub API
+  confirms it: the local marker if this box has one, else the commit status of
+  the merged PR. Confirmed means the recorded run is in this repository, was a
+  pull_request run, concluded success, and produced a merge commit with exactly
+  this tree. Anything else, including no proof, an unset HF_CI_CACHE or an API
+  error, outputs `full` (fail closed).
 
   Needs a checkout first. Runs on the self-hosted runner itself, not inside a
-  job container, because the marker lives in the runner's HF_CI_CACHE. See
-  README.md in this directory.
+  job container, because the marker lives in the runner's HF_CI_CACHE.
+  Permissions (declare them on the job): `record` needs `contents: read`, plus
+  `statuses: write` for the cross-box commit status (optional: without it only
+  the local marker is written); `check` needs `contents: read`, `actions: read`,
+  `pull-requests: read` and `statuses: read` (the last two only matter when this
+  box has no marker). See README.md in this directory.
 
 inputs:
   mode:
@@ -19,8 +26,9 @@ inputs:
     required: true
   token:
     description: >-
-      Token for the API checks in `check` mode. The calling job needs
-      `permissions: { contents: read, actions: read }`.
+      Token for the API calls. `check` needs `contents: read, actions: read,
+      pull-requests: read, statuses: read` (the last two for the commit-status
+      path); `record` needs `statuses: write` to post the commit status.
     required: false
     default: ${{ github.token }}
 
@@ -45,4 +53,5 @@ runs:
         TT_MODE: ${{ inputs.mode }}
         TT_TOKEN: ${{ inputs.token }}
         TT_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        TT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: bash "${{ github.action_path }}/tested-tree.sh"
