@@ -115,6 +115,37 @@ on:
         required: false
         type: boolean
         default: false
+      # ── Post-deploy smoke + rollback (CI-3, docs/post-deploy-smoke.md). All
+      # opt-in: an empty smoke_url keeps today's behaviour byte for byte.
+      smoke_url:
+        description: >-
+          URL the deploy runner GETs after the shim returns (public or tailnet,
+          e.g. https://app.thehfhotel.org/healthz). Empty = no smoke check.
+        required: false
+        type: string
+        default: ""
+      smoke_expect:
+        description: >-
+          Text the smoke response body must contain. `{tag}` is replaced by the
+          deployed image tag (e.g. a /healthz that reports its revision).
+          Empty = any 2xx passes.
+        required: false
+        type: string
+        default: ""
+      smoke_timeout_seconds:
+        description: "How long to keep polling smoke_url before calling the deploy failed."
+        required: false
+        type: number
+        default: 180
+      rollback_on_failure:
+        description: >-
+          On a failed smoke check, redeploy the newest tag that last passed one
+          (commit status `deploy-evergreen/<app_name>`), check it, and still
+          fail the run. Needs `statuses: read` on the calling job (to find that
+          tag) and `statuses: write` for the record-good job.
+        required: false
+        type: boolean
+        default: false
     secrets:
       ssh_key:
         description: "Private deploy key for this app (forced-command pinned on the host)."
@@ -342,6 +373,9 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # Read-only, for the rollback's last-good lookup; only effective when the
+      # caller grants it. The token reaching the host still has no write scope.
+      statuses: read
     # Per-app group: two back-to-back pushes to the same repo can never have
     # their `docker compose up` interleave. cancel-in-progress is OFF because
     # an in-flight deploy has already pulled images and may be mid-migration;
@@ -353,6 +387,9 @@ jobs:
     # state (HF-finance's payroll + reimbursement both bind /home/deploy/
     # kbiz-queue) the callers must pass the SAME app_name, or serialize
     # themselves with their own group.
+    outputs:
+      smoke: ${{ steps.deploy.outputs.smoke }}
+      tag: ${{ steps.deploy.outputs.tag }}
     concurrency:
       group: deploy-evergreen-${{ inputs.app_name }}
       cancel-in-progress: false
@@ -440,6 +477,37 @@ jobs:
           ssh-key: ${{ secrets.ssh_key }}
           host-key: ${{ secrets.host_key }}
 
+      # Read-only: the newest commit on the default branch whose deploy passed
+      # its smoke check, as recorded by the record-good job below. Only when
+      # rollback is on. Uses curl (the runner image has no gh before
+      # estate-ci #25) and the job token's statuses:read, which the CALLER must
+      # grant; without it the lookup finds nothing and rollback is skipped,
+      # never guessed.
+      - name: Find the last good tag (rollback)
+        id: lastgood
+        if: inputs.rollback_on_failure && inputs.smoke_url != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          CONTEXT: deploy-evergreen/${{ inputs.app_name }}
+          CURRENT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          api() { curl -fsS --max-time 20 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
+          tag=""
+          for sha in $(api "commits?sha=$BRANCH&per_page=30" | jq -r '.[].sha'); do
+            [ "$sha" = "$CURRENT" ] && continue
+            d=$(api "commits/$sha/statuses?per_page=100" | jq -r --arg c "$CONTEXT" '[.[]|select(.context==$c)][0] | select(.state=="success") | .description // empty')
+            if [ -n "$d" ]; then tag="${d#tag=}"; break; fi
+          done
+          if printf '%s' "$tag" | grep -Eq '^[A-Za-z0-9_.-]{1,128}$'; then
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"; echo "last good tag: $tag"
+          else
+            echo "::warning::no last-good tag found for $CONTEXT (no recorded success, or the calling job lacks statuses: read); rollback will be skipped"
+          fi
+
       - name: Deploy via SSH
         id: deploy
         env:
@@ -461,6 +529,11 @@ jobs:
           IMAGE_NAME: ${{ inputs.image_name }}
           IMAGE_REGISTRY_SECRET: ${{ secrets.image_registry }}
           REPO_OWNER: ${{ github.repository_owner }}
+          SMOKE_URL: ${{ inputs.smoke_url }}
+          SMOKE_EXPECT: ${{ inputs.smoke_expect }}
+          SMOKE_TIMEOUT: ${{ inputs.smoke_timeout_seconds }}
+          ROLLBACK: ${{ inputs.rollback_on_failure }}
+          LAST_GOOD_TAG: ${{ steps.lastgood.outputs.tag }}
         run: |
           set -euo pipefail
 
@@ -561,42 +634,91 @@ jobs:
             done <<< "$ENV_PAYLOAD"
           fi
 
-          # Runtime env shipped alongside compose; docker compose reads ./.env
-          # on `up`. Caller-supplied lines are written unconditionally, empty
-          # values included: an empty value is a valid (usually fail-closed)
-          # state, and writing it explicitly means a rotated-then-cleared
-          # secret cannot leave a stale value behind in the container.
-          {
-            printf 'IMAGE_TAG=%s\n' "$IMAGE_TAG"
-            printf 'HOST_PORT=%s\n' "$HOST_PORT"
-            if [ -n "${REGISTRY:-}" ]; then
-              printf 'IMAGE_REGISTRY=%s\n' "$REGISTRY"
-            fi
-            if [ -n "${ENV_PAYLOAD:-}" ]; then
-              printf '%s\n' "$ENV_PAYLOAD"
-            fi
-          } > .env
-          tar -czf /tmp/deploy.tar.gz docker-compose.yml .env
-          rm -f .env
+          # ship TAG: write .env for TAG, tar it with compose, hand it to the
+          # host's forced command. Called once for the deploy and, only on a
+          # failed smoke check with rollback on, once more for the last good tag.
+          ship() {
+            # Runtime env shipped alongside compose; docker compose reads ./.env
+            # on `up`. Caller-supplied lines are written unconditionally, empty
+            # values included: an empty value is a valid (usually fail-closed)
+            # state, and writing it explicitly means a rotated-then-cleared
+            # secret cannot leave a stale value behind in the container.
+            {
+              printf 'IMAGE_TAG=%s\n' "$1"
+              printf 'HOST_PORT=%s\n' "$HOST_PORT"
+              if [ -n "${REGISTRY:-}" ]; then
+                printf 'IMAGE_REGISTRY=%s\n' "$REGISTRY"
+              fi
+              if [ -n "${ENV_PAYLOAD:-}" ]; then
+                printf '%s\n' "$ENV_PAYLOAD"
+              fi
+            } > .env
+            tar -czf /tmp/deploy.tar.gz docker-compose.yml .env
+            rm -f .env
 
-          # The forced command in the host's authorized_keys runs
-          # /srv/run-deploy-<app>.sh with this JSON as stdin. No other command
-          # is reachable from this key.
-          jq -n \
-            --arg commit_sha         "$GITHUB_SHA" \
-            --arg deploy_payload_b64 "$(base64 -w0 < /tmp/deploy.tar.gz)" \
-            --arg ghcr_user          "$GHCR_USER" \
-            --arg ghcr_token         "$GHCR_TOKEN" \
-            '{
-              commit_sha: $commit_sha,
-              deploy_payload_b64: $deploy_payload_b64,
-              ghcr: { user: $ghcr_user, token: $ghcr_token }
-            }' \
-          | ssh -i ~/.ssh/deploy_key \
-              -o StrictHostKeyChecking=yes \
-              -o UserKnownHostsFile=~/.ssh/known_hosts \
-              -o ProxyCommand="cloudflared --edge-ip-version 4 access ssh --hostname %h" \
-              "deploy@${DEPLOY_HOST}"
+            # The forced command in the host's authorized_keys runs
+            # /srv/run-deploy-<app>.sh with this JSON as stdin. No other command
+            # is reachable from this key.
+            jq -n \
+              --arg commit_sha         "$GITHUB_SHA" \
+              --arg deploy_payload_b64 "$(base64 -w0 < /tmp/deploy.tar.gz)" \
+              --arg ghcr_user          "$GHCR_USER" \
+              --arg ghcr_token         "$GHCR_TOKEN" \
+              '{
+                commit_sha: $commit_sha,
+                deploy_payload_b64: $deploy_payload_b64,
+                ghcr: { user: $ghcr_user, token: $ghcr_token }
+              }' \
+            | ssh -i ~/.ssh/deploy_key \
+                -o StrictHostKeyChecking=yes \
+                -o UserKnownHostsFile=~/.ssh/known_hosts \
+                -o ProxyCommand="cloudflared --edge-ip-version 4 access ssh --hostname %h" \
+                "deploy@${DEPLOY_HOST}"
+          }
+
+          # smoke TAG: poll SMOKE_URL until a 2xx whose body holds SMOKE_EXPECT
+          # ({tag} -> TAG). Never prints the body beyond 120 bytes.
+          smoke() {
+            want="${SMOKE_EXPECT:-}"
+            want="${want//\{tag\}/$1}"
+            deadline=$(( $(date +%s) + ${SMOKE_TIMEOUT:-180} ))
+            while :; do
+              code=$(curl -sS -o /tmp/smoke.body -w '%{http_code}' --max-time 10 "$SMOKE_URL" 2>/dev/null || echo 000)
+              if [ "${code:0:1}" = "2" ] && { [ -z "$want" ] || grep -qF -- "$want" /tmp/smoke.body; }; then
+                echo "smoke OK: HTTP $code${want:+, found the expected text}"; return 0
+              fi
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::smoke FAILED for ${APP_NAME} at tag $1: last HTTP $code${want:+, expected text not found}; body starts: $(head -c 120 /tmp/smoke.body 2>/dev/null | tr -c '[:print:]' '.')"
+                return 1
+              fi
+              sleep 5
+            done
+          }
+
+          ship "$IMAGE_TAG"
+          if [ -z "${SMOKE_URL:-}" ]; then
+            exit 0
+          fi
+          if smoke "$IMAGE_TAG"; then
+            echo "smoke=pass" >> "$GITHUB_OUTPUT"
+            echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "smoke=fail" >> "$GITHUB_OUTPUT"
+          if [ "${ROLLBACK:-false}" = "true" ] && [ -n "${LAST_GOOD_TAG:-}" ] && [ "$LAST_GOOD_TAG" != "$IMAGE_TAG" ]; then
+            echo "::warning::rolling ${APP_NAME} back to the last good tag ${LAST_GOOD_TAG}"
+            ship "$LAST_GOOD_TAG"
+            if smoke "$LAST_GOOD_TAG"; then
+              echo "rollback=ok" >> "$GITHUB_OUTPUT"
+              echo "::error::${APP_NAME} ${IMAGE_TAG} failed its smoke check and was ROLLED BACK to ${LAST_GOOD_TAG} (healthy). Fix forward."
+            else
+              echo "rollback=failed" >> "$GITHUB_OUTPUT"
+              echo "::error::${APP_NAME}: the rollback to ${LAST_GOOD_TAG} did not pass the smoke check either. Production needs a person."
+            fi
+          elif [ "${ROLLBACK:-false}" = "true" ]; then
+            echo "::error::smoke failed and no last-good tag is known: no rollback attempted."
+          fi
+          exit 1
 
       - name: Deploy summary
         run: |
@@ -625,3 +747,34 @@ jobs:
           IMAGE_NAME: ${{ inputs.image_name }}
           REGISTRY: ${{ steps.deploy.outputs.registry }}
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+
+  # Marks this commit as the last good deploy of the app (commit status
+  # `deploy-evergreen/<app_name>`, description `tag=<image tag>`), which the
+  # next run's rollback reads. Its own job on purpose: the deploy job hands its
+  # token to the host, so it must never hold a write scope. This one never
+  # talks to the host. Needs `statuses: write` granted by the caller; without
+  # it the status is not written (warning) and rollback has nothing to use.
+  record-good:
+    name: Record ${{ inputs.app_name }} as last good
+    needs: [deploy]
+    if: needs.deploy.outputs.smoke == 'pass' && inputs.rollback_on_failure
+    runs-on: ${{ inputs.runner_labels != '' && fromJSON(inputs.runner_labels) || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      statuses: write
+    steps:
+      - name: Write the deploy-evergreen status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          CONTEXT: deploy-evergreen/${{ inputs.app_name }}
+          TAG: ${{ needs.deploy.outputs.tag }}
+        run: |
+          set -euo pipefail
+          jq -n --arg c "$CONTEXT" --arg d "tag=$TAG" '{state:"success",context:$c,description:$d}' \
+          | curl -fsS --max-time 20 -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/statuses/$SHA" -d @- >/dev/null
+          echo "recorded $CONTEXT tag=$TAG on $SHA"
+

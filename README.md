@@ -30,8 +30,9 @@ that changes this — GitHub resolves a `uses:` across repositories against the
 public caller. The reverse direction works fine: a private repo can call a
 public reusable workflow.
 
-Four estate repos are public — `estate-ci`, `ezbookkeeping`, `linen-truck`,
-`reimbursement` — so a private `estate-ci` would serve only the private half
+The public estate repos (checked 2026-11-04) are `estate-ci`, `expense-ledger`,
+`linen-truck` and `reimbursement-v2` (plus the archived `reimbursement`); every one
+of them runs only on GitHub-hosted `ubuntu-latest`. A private `estate-ci` would serve only the private half
 of the estate and the public half would keep its own copies. A public
 `estate-ci` serves all of them. Visibility here is a consequence of that
 arithmetic, not a preference. (The list above has moved over time as repos
@@ -250,6 +251,10 @@ in the diff.
 | `compose_path` | no | `docker-compose.yml` | Renamed to `docker-compose.yml` inside the tarball; the run-deploy shim looks for nothing else. |
 | `platforms` | no | `linux/amd64` | |
 | `force_deploy` | no | `false` | Skip the build, re-roll `:latest`. Secret rotation or a wedged container — an empty commit is *not* an alternative, it deploys nothing and reports green. |
+| `smoke_url` | no | `""` | Opt-in post-deploy check: GET until 2xx (see `docs/post-deploy-smoke.md`). Empty = unchanged behaviour. |
+| `smoke_expect` | no | `""` | Text the smoke body must contain; `{tag}` = the deployed image tag. |
+| `smoke_timeout_seconds` | no | `180` | Polling window for the smoke check. |
+| `rollback_on_failure` | no | `false` | On a failed smoke, redeploy the last tag that passed one, re-check, and still fail. Caller grants `statuses: write`. |
 
 | Secret | Req | Notes |
 |---|---|---|
