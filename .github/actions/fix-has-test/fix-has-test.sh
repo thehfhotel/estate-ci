@@ -17,7 +17,7 @@ title="$(jq -r '.pull_request.title // ""' "$EVENT")"
 body="$(jq -r '.pull_request.body // ""' "$EVENT")"
 
 shopt -s nocasematch
-if ! [[ "$title" =~ ^fix(:|\() ]]; then
+if ! [[ "$title" =~ ^fix(:|\(|!:) ]]; then
   echo "not a fix PR"
   exit 0
 fi
@@ -31,7 +31,7 @@ if [ -n "$reason" ]; then
   exit 0
 fi
 
-# glob -> anchored ERE. ** crosses '/', and "**/" may match nothing; * does not.
+# glob -> anchored ERE. ** crosses '/', and "**/" may match nothing; * does not. '?' and [] are literals.
 glob_to_re() {
   local g="$1" re="" c i=0 n=${#1}
   while [ "$i" -lt "$n" ]; do
@@ -56,7 +56,7 @@ glob_to_re() {
 matches_any() {
   local f="$1" g
   while IFS= read -r g; do
-    g="${g//[[:space:]]/}"
+    g="${g#"${g%%[![:space:]]*}"}"; g="${g%"${g##*[![:space:]]}"}"   # trim ends only
     [ -z "$g" ] && continue
     [ "${g:0:1}" = "!" ] && continue
     [[ "$f" =~ $(glob_to_re "$g") ]] && return 0
@@ -67,7 +67,7 @@ matches_any() {
 excluded() {
   local f="$1" g
   while IFS= read -r g; do
-    g="${g//[[:space:]]/}"
+    g="${g#"${g%%[![:space:]]*}"}"; g="${g%"${g##*[![:space:]]}"}"
     [ "${g:0:1}" = "!" ] || continue
     [[ "$f" =~ $(glob_to_re "${g:1}") ]] && return 0
   done <<<"$2"
@@ -85,14 +85,21 @@ if ! files="$(git diff --name-only "$base...$head")"; then
   exit 0
 fi
 
+# A .rs diff that adds a test attribute. The diff is captured first: piping it into
+# `grep -q` under pipefail lets git die of SIGPIPE on a big diff (exit 141) and
+# miss a real #[test]. '+++ b/' header lines are not added code.
+rs_adds_test() {
+  local d
+  d="$(git diff -U0 "$base...$head" -- "$1")" || return 1
+  grep -qE '^\+[^+].*(#\[test\]|#\[tokio::test\]|#\[cfg\(test\)\])|^\+(#\[test\]|#\[tokio::test\]|#\[cfg\(test\)\])' <<<"$d"   # here-string, not a pipe: no SIGPIPE
+}
+
 code=() ; tests=()
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   if matches_any "$f" "$FHT_TEST_GLOBS"; then
     tests+=("$f")
-  elif [[ "$f" == *.rs ]] \
-    && git diff -U0 "$base...$head" -- "$f" \
-      | grep -qE '^\+.*(#\[test\]|#\[tokio::test\]|#\[cfg\(test\)\])'; then
+  elif [[ "$f" == *.rs ]] && rs_adds_test "$f"; then
     tests+=("$f")
     code+=("$f")   # same file also holds code: it counts for both
   elif matches_any "$f" "$FHT_CODE_GLOBS" && ! excluded "$f" "$FHT_CODE_GLOBS"; then

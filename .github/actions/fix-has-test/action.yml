@@ -1,6 +1,6 @@
 name: "fix-has-test: a fix PR ships a test"
 description: >-
-  CI-5 rule (hf-agents#259): a PR titled `fix:` / `fix(...)` that changes app
+  CI-5 rule (hf-agents#259): a PR titled `fix:`, `fix(...)` or `fix!:` that changes app
   code must also add or change a test, or say `no-test: <reason>` on a line of
   the PR body. Warning-only until 2026-11-19, then run with `mode: fail`.
 
@@ -16,7 +16,8 @@ inputs:
   test-globs:
     description: >-
       Newline list of globs that count as tests. ** crosses directories (and
-      may match none), * does not. A changed .rs file whose diff adds
+      may match none), * does not; ? and [] are literals. Leading and
+      trailing spaces are trimmed. A changed .rs file whose diff adds
       #[test], #[tokio::test] or #[cfg(test)] also counts as a test change.
     required: false
     default: |

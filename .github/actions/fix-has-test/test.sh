@@ -57,6 +57,11 @@ run_case rust-hunk    'fix: x' '' 0 'changes code and tests' fail 'src/lib.rs=fn
 #[test]
 fn t(){}'
 run_case rust-nohunk  'fix: x' '' 1 '::error' fail 'src/lib.rs=fn a(){}'
+# A test attribute at the top of a >64 KiB diff: under pipefail a `git diff | grep -q`
+# pipeline would die of SIGPIPE (141) and miss it (Platform review of estate-ci#28).
+big="$(printf '#[test]\nfn t(){}\n'; for i in $(seq 1 6000); do printf 'fn filler_%05d() { let _x = 0; }\n' "$i"; done)"
+run_case rust-big     'fix: x' '' 0 'changes code and tests' fail "src/lib.rs=$big"
+run_case fix-bang     'fix!: x' '' 1 '::error' fail src/a.ts
 run_case inject       'fix: x' '$(touch '"$TMP"'/pwned) `touch '"$TMP"'/pwned2` "; touch '"$TMP"'/pwned3
 no-test: $(touch '"$TMP"'/pwned4) `id`' 0 'accepted' fail src/a.ts
 for p in pwned pwned2 pwned3 pwned4; do
