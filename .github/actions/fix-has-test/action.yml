@@ -1,0 +1,64 @@
+name: "fix-has-test: a fix PR ships a test"
+description: >-
+  CI-5 rule (hf-agents#259): a PR titled `fix:`, `fix(...)` or `fix!:` that changes app
+  code must also add or change a test, or say `no-test: <reason>` on a line of
+  the PR body. Warning-only until 2026-11-19, then run with `mode: fail`.
+
+  Needs a checkout with history for the PR (fetch-depth: 0), because the
+  action runs `git diff base...head`. Only acts on pull_request events; for
+  anything else, and for non-fix titles, it prints a line and passes.
+
+inputs:
+  mode:
+    description: "`warn` (annotate, exit 0) or `fail` (annotate, exit 1)."
+    required: false
+    default: "warn"
+  test-globs:
+    description: >-
+      Newline list of globs that count as tests. ** crosses directories (and
+      may match none), * does not; ? and [] are literals. Leading and
+      trailing spaces are trimmed. A changed .rs file whose diff adds
+      #[test], #[tokio::test] or #[cfg(test)] also counts as a test change.
+    required: false
+    default: |
+      **/*.test.*
+      **/*.spec.*
+      **/test_*.py
+      **/*_test.py
+      **/tests/**
+      **/__tests__/**
+      **/e2e/**
+  code-globs:
+    description: >-
+      Newline list of globs that count as app code. A line starting with `!`
+      excludes. Test files are never code.
+    required: false
+    default: |
+      **
+      !docs/**
+      !**/*.md
+      !.github/**
+  base-sha:
+    description: "Commit to diff against. Empty: the PR base."
+    required: false
+    default: ""
+  head-sha:
+    description: "Commit to diff to. Empty: the PR head."
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: fix-has-test
+      shell: bash
+      env:
+        FHT_MODE: ${{ inputs.mode }}
+        FHT_TEST_GLOBS: ${{ inputs.test-globs }}
+        FHT_CODE_GLOBS: ${{ inputs.code-globs }}
+        FHT_BASE: ${{ inputs.base-sha || github.event.pull_request.base.sha }}
+        FHT_HEAD: ${{ inputs.head-sha || github.event.pull_request.head.sha }}
+        FHT_EVENT_NAME: ${{ github.event_name }}
+      # The PR title/body are read from $GITHUB_EVENT_PATH by the script, never
+      # interpolated here, so they cannot inject shell.
+      run: bash "${{ github.action_path }}/fix-has-test.sh"

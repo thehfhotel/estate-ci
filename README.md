@@ -11,6 +11,7 @@ near-copy of `deploy.yml`.
 | `.github/actions/evergreen-ssh/` | Composite — pinned, checksum-verified cloudflared plus the deploy key and `known_hosts`. |
 | `.github/actions/route/` | Composite — path-based suite selection and a docs-only short-circuit, for a tiny first job on the express lane. |
 | `.github/actions/tested-tree/` | Composite — record the tree a green PR run tested, and on push to main skip the tests for a tree that already passed (`record` / `check`). |
+| `.github/actions/fix-has-test/` | Composite — a `fix:` PR that changes app code must add or change a test, or say `no-test: <reason>` in its body (CI-5; warning-only until 2026-11-19). |
 | `runner/` | Generic self-hosted runner image (`Dockerfile` + `entrypoint.sh` + `compose.yml` + `hooks/` job-started and job-completed hooks + `ops/stray-check.sh`) built and run on estate-owned infrastructure. Org-specific values (URL, group, labels, work dir, host paths) are env vars, never baked in. See `runner/README.md`. |
 
 Why it exists: the estate had accumulated fourteen near-copies of the same
@@ -117,6 +118,35 @@ carrying its own:
 | PR runs cancel, main and deploy runs never do | `docs/concurrency.md` |
 | Put CI containers in the CI cgroup slice | `docs/cgroup-parent.md` |
 | Toolchains (Bun, Node, Python) already on the runner image | `runner/README.md`, "Preinstalled toolchains" |
+
+## fix-has-test
+
+The CI-5 rule (hf-agents#259, owner 2026-11-05): a `fix:` / `fix(...)` PR that
+changes app code also adds or changes a test that fails without the fix. When no
+test is possible, the PR body has a line `no-test: <reason>`. Other PRs, docs-only
+fixes and non-`pull_request` events pass untouched. The check is by file path
+(Rust files count as tests when the diff adds `#[test]`, `#[tokio::test]` or
+`#[cfg(test)]`); it cannot prove the test fails without the fix, review does that.
+
+**Warning-only until 2026-11-19**, then switch `mode: warn` to `mode: fail`.
+
+```yaml
+fix-has-test:
+  if: github.event_name == 'pull_request'
+  runs-on: ubuntu-latest   # your express-lane runner
+  permissions:
+    contents: read
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0   # the action runs `git diff base...head`
+    - uses: thehfhotel/estate-ci/.github/actions/fix-has-test@main
+      with:
+        mode: warn   # 2026-11-19: fail
+```
+
+Inputs `test-globs`, `code-globs` (`!glob` excludes), `base-sha` and `head-sha`
+are optional; see `action.yml`. Local test: `bash .github/actions/fix-has-test/test.sh`.
 
 ## Self-hosted runners and the estate's own registry
 
