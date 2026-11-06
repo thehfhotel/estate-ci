@@ -672,8 +672,15 @@ jobs:
             | ssh -i ~/.ssh/deploy_key \
                 -o StrictHostKeyChecking=yes \
                 -o UserKnownHostsFile=~/.ssh/known_hosts \
+                -o ServerAliveInterval=15 -o ServerAliveCountMax=8 \
                 -o ProxyCommand="cloudflared --edge-ip-version 4 access ssh --hostname %h" \
                 "deploy@${DEPLOY_HOST}"
+            # ServerAlive*: a shim step that prints nothing for 60 s (a long
+            # pg_dump) let the cloudflared access-ssh stream go idle and drop
+            # ("client_loop: send disconnect: Broken pipe", new-hotel run
+            # 42188714640, 2026-11-06) while the host deploy kept running, so
+            # CI went red on a deploy that succeeded. Keepalives every 15 s
+            # keep the stream busy; 8 misses (2 min) still ends a dead link.
           }
 
           # smoke TAG: poll SMOKE_URL until a 2xx whose body holds SMOKE_EXPECT
